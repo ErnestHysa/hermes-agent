@@ -4934,3 +4934,131 @@ Also excludes `.env` explicitly. ✓
 ---
 
 **End Pass #52**
+
+
+---
+
+## Pass #53 - API Design, Rate Limiting & DoS Mitigation - 2026-05-24T17:22:00Z
+
+### 1. Rate Limiting
+
+**API Server (api_server.py) - no per-key enforcement**
+- No per-client-API-key rate limiting exists. _check_auth() validates the Bearer token but does not track request counts or burst per key.
+- Enforced limit: _MAX_CONCURRENT_RUNS = 10 (line 2825) caps concurrent /v1/runs executions - hard concurrency limit, not a rate limit. Returns HTTP 429 with code="rate_limit_exceeded" when exceeded.
+- No X-RateLimit-* response headers are emitted.
+- No sliding-window or token-bucket per-key tracking.
+
+**Webhook (webhook.py) - per-route fixed-window rate limiting**
+- Lines 406-413: per-route fixed-window rate limiter, configurable via rate_limit extra (default 30/minute).
+- Returns HTTP 429 {"error": "Rate limit exceeded"} when window is full.
+- Rate limit state lives in _rate_counts: Dict[str, List[float]] - in-memory, per route. No distributed tracking across multiple gateway instances.
+
+**Signal (signal_rate_limit.py)**
+- Token-bucket simulator for Signal attachment sends. Carries retry_after from server on 429 and uses it to recalibrate refill rate.
+- SIGNAL_RATE_LIMIT_MAX_ATTEMPTS = 2 for retries.
+
+**Pairing (pairing.py)**
+- MAX_PENDING_PER_PLATFORM = 3 - max pending pairing codes per platform.
+- MAX_FAILED_ATTEMPTS = 5 - lockout after 5 failed approvals (line 50).
+
+**Slack**
+- 3-retry exponential backoff on 429 (1s, 2s) for conversations.replies (slack.py:2627).
+
+**General DoS - agent cache cap**
+- _AGENT_CACHE_MAX_SIZE = 128 (run.py:64) - max cached AIAgent instances.
+- _AGENT_CACHE_IDLE_TTL_SECS = 3600.0 (run.py:65) - evict agents idle >1h.
+- Enforced via LRU OrderedDict + TTL sweep from _session_expiry_watcher().
+
+### 2. API Endpoint Design
+
+**API Server - OpenAI-compatible REST surface**
+- All endpoints follow REST conventions: POST /v1/chat/completions, GET /v1/models, etc.
+- HTTP status codes used correctly:
+  - 200 for successful responses
+  - 400 for malformed requests / invalid JSON / validation errors
+  - 401 for bad API key
+  - 403 for forbidden (CORS origin rejection, session continuation without key)
+  - 404 for unknown routes
+  - 413 for oversized request bodies (MAX_REQUEST_BYTES = 10_000_000 / 10MB)
+  - 429 for rate limit exceeded (concurrent runs cap)
+  - 500 for internal errors
+  - 502 for agent failures with partial/empty response
+- Consistent error envelope via _openai_error(): {"error": {"message": ..., "type": ..., "param": ..., "code": ...}}
+- CORS middleware validates origin before routing (line 496: returns 403 for disallowed origin).
+- Security headers applied to all responses: CSP, X-Frame-Options, Strict-Transport-Security, etc. (line 540-548).
+
+**Webhooks**
+- Returns 404 for unknown routes, 413 for oversized bodies, 401 for invalid HMAC, 403 for missing secret, 429 for rate limit, 400 for unparseable body, 200 for ignored events, 202 for accepted async processing, 502 for delivery failure.
+
+### 3. DoS Protection
+
+**Request size limits**
+- API server: MAX_REQUEST_BYTES = 10_000_000 (10MB) - enforced by body_limit_middleware before JSON parsing (lines 526-538).
+- Webhook: _max_body_bytes = 1_048_576 (1MB) - checked before reading body (line 370).
+- Content normalization: MAX_NORMALIZED_TEXT_LENGTH = 65_536 (64KB) per content part; MAX_CONTENT_LIST_SIZE = 1_000 items per list; recursion depth capped at 10 (lines 63-64, 104-159).
+
+**Timeouts**
+- CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0 - keepalive comment sent every 30s during SSE streaming (line 62, 1457).
+- gh pr comment subprocess: timeout=30 seconds (webhook.py:858).
+- subprocess.Popen in tui_gateway/server.py: no explicit timeout on worker process (line 202), but queue.Queue with _SLASH_WORKER_TIMEOUT_S = max(5.0, ...) (line 240) for slash command execution.
+- No per-request overall timeout on API server agent runs - runs can be long.
+
+**Resource limits**
+- _MAX_CONCURRENT_RUNS = 10 caps concurrent runs at API server (line 2825).
+- _AGENT_CACHE_MAX_SIZE = 128 caps cached agent instances (run.py:64).
+- _RUN_STREAM_TTL = 300 - orphaned SSE streams swept after 5 minutes (line 2826).
+- _RUN_STATUS_TTL = 3600 - terminal run status retained for 1 hour (line 2827).
+- MAX_STORED_RESPONSES = 100 in ResponseStore (api_server.py:60).
+- _MAX_SESSION_HEADER_LEN = 256 - session key header length cap to prevent memory burn (api_server.py:803).
+- Idempotency cache: max_items=1000, ttl_seconds=300 (_IdempotencyCache, line 565).
+
+### 4. Concurrent Connection Limits
+
+**API Server**
+- _MAX_CONCURRENT_RUNS = 10 - hard cap on concurrent /v1/runs submissions (line 2825). Enforced before run starts. Returns 429 rate_limit_exceeded.
+- Active streams tracked in _run_streams: Dict[str, asyncio.Queue] (line 687).
+- _RUN_STREAM_TTL = 300 - orphaned stream cleanup.
+
+**TUI Gateway (tui_gateway/server.py)**
+- _rpc_pool_workers = 4 (default, configurable via HERMES_TUI_RPC_POOL_WORKERS, line 164) - ThreadPoolExecutor for long-running RPC handlers.
+- LONG_HANDLERS (line 146): browser.manage, cli.exec, session.branch, session.compress, session.resume, shell.exec, skills.manage, slash.exec - routed to thread pool to avoid blocking the dispatcher.
+- No explicit inbound connection limit; the pool caps concurrent long handlers.
+- _sessions: dict - no hard cap on number of active TUI sessions.
+
+**No global connection limit** - no MAX_CONNECTIONS or similar across the gateway process.
+
+### 5. API Versioning
+
+**No explicit API versioning scheme**
+- The API server uses /v1/ path prefix for all endpoints, following OpenAI convention.
+- No /v2/, /v3/ or version negotiation headers.
+- No formal deprecation policy documented in code. GET /v1/capabilities advertises the current stable surface for discovery, acting as a self-documenting version contract.
+- /v1/capabilities (line 992-1049) is the version-stability mechanism: it lists which features are available so clients can probe capability rather than assume by version number.
+- No formal API_SERVER_VERSION or breaking-change announcement mechanism in the codebase.
+
+### 6. Webhook Delivery
+
+**Retry backoff**
+- No automatic retry on webhook delivery failures. The send() method (webhook.py:222) dispatches to delivery target and returns SendResult - no internal retry loop.
+- External delivery (GitHub gh pr comment) has a 30s subprocess timeout but no retry on failure (line 858).
+- Cross-platform delivery uses the target adapter's send() directly - no retry layer.
+
+**Idempotency**
+- Lines 495-512: _seen_deliveries TTL cache keyed by delivery_id (from X-GitHub-Delivery / svix-id / X-Request-ID header).
+- TTL: _idempotency_ttl = 3600 seconds (1 hour).
+- Returns HTTP 200 {"status": "duplicate", ...} on repeat delivery within TTL.
+- Cache pruned on every POST to keep size bounded.
+
+**Timeout**
+- No explicit timeout on webhook agent processing. handle_message() runs as asyncio.create_task (line 616) and returns 202 immediately.
+- _background_tasks: set tracks pending tasks with add_done_callback for cleanup (lines 617-618).
+
+**Signature validation (auth-before-body)**
+- Content-Length checked before body read (line 369).
+- HMAC validated before any processing (line 386).
+- INSECURE_NO_AUTH mode only allowed on loopback hosts - startup validation (line 165) prevents accidental public exposure.
+- Svix signature validation with 300-second tolerance window (line 697).
+
+---
+
+*Pass #53 complete - 6 focus areas covered.*
