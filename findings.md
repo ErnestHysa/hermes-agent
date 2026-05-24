@@ -5247,3 +5247,105 @@ The unknown command error tells users what to do next: use `/commands` or resend
 ---
 
 *Pass #54 complete - 13 findings across 5 focus areas.*
+
+---
+
+## Pass #55 – Logging, Observability & Telemetry Deep Dive – 2026-01-26T00:00:00Z
+
+### 1. Structured Logging Consistency
+
+**Logger setup** — `hermes_logging.py` is the single centralized entry point. Key design decisions:
+
+- `setup_logging()` is idempotent (safe to call twice; guard via `_logging_initialized` global)
+- Three log files: `agent.log` (INFO+, catch-all), `errors.log` (WARNING+), `gateway.log` (INFO+, gateway components only via `_ComponentFilter`)
+- All use `RotatingFileHandler` with `RedactingFormatter` — secrets never reach disk
+- `setup_verbose_logging()` adds a DEBUG-level console handler for `-v` mode
+
+**Session context injection** — `hermes_logging.py` lines 90–119. A custom `LogRecordFactory` (not a Filter) injects `%(session_tag)s` into every LogRecord globally. This guarantees the session tag is always available even when third-party code creates records. Thread-local storage via `_session_context = threading.local()` makes it session-safe.
+
+**Level usage** — Standard Python `logging.DEBUG/INFO/WARNING/ERROR` used consistently throughout. Third-party loggers (openai, httpx, urllib3, etc.) are silenced to WARNING via the `_NOISY_LOGGERS` tuple at import time. No use of `critical` observed; `exception()` used with `exc_info=True` for unexpected errors (correct pattern).
+
+**Log injection safety** — All log output passes through `RedactingFormatter` → `redact_sensitive_text()` (`agent/redact.py`). The redaction pipeline covers: known API key prefixes (sk-, ghp_, github_pat_, xoxb-, AIza..., etc.), ENV assignments (`KEY=secret`), JSON fields (`"apiKey": "value"`), Authorization headers, Telegram bot tokens, private key blocks, DB connection string passwords, JWT tokens (eyJ...), URL userinfo, and URL query string tokens. The redaction is on-by-default but can be disabled via `HERMES_REDACT_SECRETS=false` — a startup warning is logged when disabled.
+
+**No user-controlled log injection** — Log messages use `%s`-style formatting, not f-strings or direct string concatenation. Session IDs and task IDs come from internal AIAgent state, not from user input.
+
+### 2. Observability Patterns
+
+**Distributed tracing** — `plugins/observability/langfuse/` provides Langfuse integration. Traces cover conversation turns, LLM calls, tool usage, and tool outputs. The plugin fails open (no crash if SDK is missing or credentials are wrong). It validates Langfuse key prefixes at init time and warns once if placeholder credentials are detected, preventing silent trace-dropping (#23823 fix). Observability metadata (model, tokens, duration, tool trace) is attached to subagent results per RELEASE_v0.3.0.
+
+**Placeholder detection** — `plugins/observability/langfuse/__init__.py` lines 165–190. Real Langfuse keys always start with `pk-lf-` / `sk-lf-`. If keys don't match these prefixes, a WARNING is emitted once and the client is set to `_INIT_FAILED` so every subsequent hook call short-circuits without re-checking env vars.
+
+**Sensitive data in traces** — The plugin uses `_safe_value()` with `HERMES_LANGFUSE_MAX_CHARS` (default 12000) and depth limit of 4 to truncate large payloads. For read_file payloads it extracts only metadata (line counts, file size, preview head/tail) rather than full content. Base64 content is replaced with `{"omitted": True, "length": N}`. This prevents traces from ballooning and keeps sensitive file content out of Langfuse.
+
+**No OpenTelemetry** — No OpenTelemetry SDK usage found. No Prometheus, Datadog, or CloudWatch metrics integration found. The only structured observability export is Langfuse.
+
+**Internal metrics** — `tools/mcp_tool.py` (line 675) maintains per-server metrics dict: `{"requests", "errors", "tokens_used", "tool_use_count"}`. `agent/insights.py` exists for activity/usage reporting but appears to be internal-only.
+
+### 3. Log Aggregation Safety
+
+**Rotation** — `hermes_logging.py` lines 298–327. `_ManagedRotatingFileHandler` wraps Python's `RotatingFileHandler`. Rotation parameters are configurable via config.yaml (`logging.max_size_mb`, `logging.backup_count`) or constructor args. Defaults: `agent.log` 5MB / 3 backups, `errors.log` 2MB / 2 backups, `gateway.log` 5MB / 3 backups.
+
+**No compression** — Rotated backup files are NOT compressed. After 3 rotations, the oldest `.log` file is deleted. With default 5MB and high-volume loggers, this could consume significant disk space (3 × 5MB = 15MB per log type, plus current files). For long-running gateways with verbose logging this is a potential disk space concern.
+
+**Managed-mode permissions** — `_ManagedRotatingFileHandler._chmod_if_managed()` (lines 313–318) applies `chmod 0660` after both initial `_open()` and `doRollover()`. This ensures group-writable permissions in NixOS managed environments where stateDir uses setgid 2770.
+
+**Session log compression** — `gateway/run.py` line 8212: "auto-compress pathologically large transcripts" — but this is about conversation session history compression, not log file compression.
+
+**Disk space gap** — No automatic disk-space checks before rotation. If disk is nearly full and a rotation trigger occurs, the write could fail. No `backupCount=0` safety net observed.
+
+### 4. Error Reporting Quality
+
+**Exception wrapping** — Platform adapters (Slack, WeCom, Signal, etc.) consistently use `logger.exception()` or `logger.error(..., exc_info=True)` for unexpected errors. This provides full traceback context in logs while keeping the process alive.
+
+**Stack trace handling in TUI gateway** — `tui_gateway/server.py` lines 50–107 installs both `sys.excepthook` (for main thread) and `threading.excepthook` (for background threads). Both write the raw unredacted traceback to `logs/tui_gateway_crash.log` and print a user-facing first line to stderr. The raw stack trace written to the crash log is NOT passed through `RedactingFormatter` — it contains the full exception text verbatim. Since crash logs are operator-readable files (not sent to external services), this is lower risk but worth noting.
+
+**Stack trace handling in tui_gateway/entry.py** — Lines 100–106 write raw `traceback.format_stack()` output directly to the crash log without redaction. Same concern as server.py.
+
+**Tool error sanitization** — `dispatch()` in model_tools.py wraps all tool execution: catches `Exception`, logs with `logger.exception()`, sanitizes via `_sanitize_tool_error()`, returns a JSON error string to the model. The sanitizer itself is wrapped defensively (`except Exception: sanitized = raw`). Malformed JSON args return error JSON to the model — raw Python tracebacks never leak to the LLM.
+
+**Hook error containment** — `run_agent.py` hook failures (`on_session_start`, `pre_llm_call`, etc.) are caught with `except Exception` and logged at WARNING. They do not abort the turn. This is correct — hooks are enhancements.
+
+**Langfuse plugin error handling** — `_get_langfuse()` catches all exceptions during client init (line 214: `except Exception as exc: logger.warning(...)`) and returns `None`, causing all hooks to no-op. Fail-open design.
+
+### 5. Health Check Endpoints
+
+**api_server platform** — `gateway/platforms/api_server.py` lines 946–969:
+- `GET /health` → `{"status": "ok", "platform": "hermes-agent"}` — simple, no auth required
+- `GET /health/detailed` → full runtime state including `gateway_state`, `platforms` (per-platform status), `active_agents`, `exit_reason`, `updated_at`, `pid` — no auth required. Exposes internal platform connectivity status and runtime state.
+- `GET /v1/health` → same as `/health`
+- Registered at lines 3428–3430.
+
+**webhook platform** — `gateway/platforms/webhook.py` line 292: `_handle_health` returns `{"status": "ok"}` — no detailed info, no auth.
+
+**wecom_callback platform** — `gateway/platforms/wecom_callback.py` line 243: `_handle_health` — simple ok response.
+
+**msgraph_webhook** — Uses configurable `health_path` (default `/health`). Line 179: `_handle_health` — not inspected.
+
+**Signal** — `gateway/platforms/signal.py` lines 64, 276, 421–424. Periodic health check every 30s (`HEALTH_CHECK_INTERVAL = 30.0`). On failure it forces reconnect and logs WARNING with status code.
+
+**WhatsApp** — No native health endpoint. Probes external bridge at `http://127.0.0.1:{bridge_port}/health` (lines 582, 651, 683). If bridge is down, connection retries continue silently.
+
+**TUI gateway** — `tui_gateway/entry.py` lines 17, 71: "gateway-exited banner in the TUI has no trace" — no HTTP health endpoint.
+
+**ACP adapter** — `_BENIGN_PROBE_METHODS = frozenset({"ping", "health", "healthcheck"})` for liveness probes.
+
+**hermes doctor** — `hermes_cli/doctor.py`. Comprehensive CLI health check across all configured providers. Builds a provider list from `_build_apikey_providers_list()` (lines 244–330) and checks connectivity via `/v1/models` endpoints. No automatic retry on failure — reports individual provider status.
+
+**Health check gaps:**
+- No authentication on any health endpoint. `/health/detailed` exposes internal state (platform names, PID, gateway state) without auth.
+- No dependency health checks — the Signal platform checks its own relay but no platform checks the database, session store, or credential pool.
+- `/health/detailed` returns `platforms: {}` when no platforms are connected — an empty dict is indistinguishable from a healthy zero-platform state.
+- No health check for the TUI gateway process itself.
+
+### Findings Summary
+
+| ID | Area | Description | Severity |
+|----|------|-------------|----------|
+| P55-1 | Log Aggregation | No log file compression — rotated files remain as plain `.log.N` files. Disk space grows unbounded with log volume. | LOW |
+| P55-2 | Health Checks | `/health/detailed` is unauthenticated and exposes internal platform state, PID, and gateway runtime details. | LOW |
+| P55-3 | Error Reporting | TUI gateway crash logs (`tui_gateway/server.py` line 52, `tui_gateway/entry.py` line 106) write raw unredacted stack traces to disk. Sensitive data in exception messages could reach operator-readable crash logs. | LOW |
+| P55-4 | Observability | No OpenTelemetry, Prometheus, Datadog, or CloudWatch integration. Langfuse is the only structured tracing backend and it is opt-in. Production deployments relying on vendor metrics will need custom instrumentation. | INFO |
+| P55-5 | Log Aggregation | No disk-space check before rotation — if disk is nearly full when rotation triggers, writes silently fail with no operator alert. | LOW |
+| P55-6 | Health Checks | No health check endpoint for TUI gateway process itself. WhatsApp platform has no local health check — relies entirely on external bridge. Signal health-check failures force reconnect but don't alert operator beyond log entries. | LOW |
+
+*Pass #55 complete - 6 findings across 5 focus areas.*
