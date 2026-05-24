@@ -7485,3 +7485,180 @@ Bearer token required (`_check_auth()` at line 770). CORS headers added based on
 ---
 
 *Pass #66 complete — 2026-05-24*
+
+
+---
+
+## Pass #67 – Platform Adapter Health, Resilience & Observability Deep Dive – 2026-05-25
+
+### 1. Platform Health Monitoring
+
+#### 1.1 Per-Platform Health Checks (Active Monitoring)
+
+**Signal adapter** (`gateway/platforms/signal.py`):
+- Has dedicated `_health_monitor()` coroutine (lines 401-425) that runs on a `HEALTH_CHECK_INTERVAL = 30s` loop.
+- On each tick, checks `time.time() - self._last_sse_activity > HEALTH_CHECK_STALE_THRESHOLD (120s)` — if SSE has been silent for 2+ minutes, it pings the signal-cli daemon at `{http_url}/api/v1/check` with a 10s timeout.
+- If daemon returns non-200, or any exception occurs, calls `_force_reconnect()` which closes the SSE stream and triggers reconnection.
+- `_last_sse_activity` is updated on every received SSE event, and also reset when daemon is confirmed alive but SSE is quiet to avoid repeated warnings.
+- This is a well-designed active health probe — not just connection-alive tracking but actual API-level verification of the daemon.
+
+**Webhook and api_server adapters**:
+- Simple `_handle_health` HTTP GET handler at `GET /health` returning `{"status": "ok", "platform": ...}` — passive health endpoint, not actively monitored by the gateway runner.
+
+#### 1.2 Runtime Status Persistence (`gateway/status.py`)
+
+`gateway/status.py` maintains a JSON runtime status file alongside `gateway.pid` with per-platform state:
+- `gateway_state`, `exit_reason`, `restart_requested`, `active_agents`
+- `platforms[platform_name] = {state, error_code, error_message}` — updated on every state transition
+
+`write_runtime_status()` is called by:
+- `BasePlatformAdapter._write_runtime_status_safe()` (base.py lines 1556, 1562, 1569) — on connect, disconnect, and fatal error
+- `GatewayRunner._update_platform_runtime_status()` (run.py) — called in reconnect watcher on every state change
+
+This gives operators a single file to read for full gateway+platform health without parsing logs.
+
+#### 1.3 Platform Connect Timeout
+
+`GatewayRunner._connect_adapter_with_timeout()` (run.py lines 2113-2130) wraps each adapter's `connect()` in asyncio.wait_for() with a configurable timeout (default 30s). Prevents one platform's slow connect from blocking others.
+
+**Gap**: Only Signal has active health check polling. Telegram, Discord, WhatsApp, etc. have no periodic probes — failures only detected on next message or exception.
+
+---
+
+### 2. Graceful Degradation — Platform Isolation
+
+#### 2.1 Per-Platform Circuit Breaker
+
+Introduced in PR #26600. Core mechanism in `gateway/run.py`:
+
+**`_failed_platforms`** (line 1747): `Dict[Platform, {"config", "attempts", "next_retry", "paused", "pause_reason"}]`
+
+**Thresholds** (lines 5615-5616):
+- `_BACKOFF_CAP = 300` — 5 minutes max between retries
+- `_PAUSE_AFTER_FAILURES = 10` — circuit breaker threshold
+
+**Exponential backoff** (line 5703): `backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)` — 30s, 60s, 120s, 240s, capped at 300s.
+
+**Pause mechanism** (`_pause_failed_platform()`, lines 2693-2727): After 10 consecutive failures, platform marked `paused: True`, `next_retry = float("inf")`. Skipped by reconnect watcher. Recovered only via `/platform resume <name>` or `hermes gateway restart`.
+
+**Manual control**: `/platform list|pause|resume` commands (run.py lines 9743-9828).
+
+#### 2.2 Platform Failure Does Not Crash Gateway
+
+`GatewayRunner._handle_adapter_fatal_error()` (lines 2447-2512):
+- `fatal_error_retryable == True` → queued for background reconnect, gateway stays alive
+- `fatal_error_retryable == False` → immediately removed from queue
+- `not self.adapters and not self._failed_platforms` → gateway shuts down
+- `not self.adapters and self._failed_platforms` → gateway stays alive for cron jobs
+
+#### 2.3 No Cascading Failure Between Platforms
+
+Each adapter is independent. One platform's failure does not affect another's retry schedule. `delivery_router.adapters` stays current — only failed platform's deliveries fail, others proceed normally. Cron scheduler has live-adapter fallback to standalone `_send_to_platform()` (scheduler.py line 735).
+
+---
+
+### 3. Platform-Specific Retry Logic
+
+#### 3.1 Gateway-Level Exponential Backoff
+
+`_platform_reconnect_watcher()` (run.py lines 5604-5739):
+- Initial delay: 10s after startup
+- Backoff: `min(30 * (2 ** (attempt - 1)), 300)` — 30s, 60s, 120s, 240s, capped at 300s
+- Paused platforms skipped until resumed
+- Applies uniformly to all platforms — no per-platform configuration
+
+#### 3.2 Signal-Specific SSE Retry
+
+`gateway/platforms/signal.py` lines 62-65:
+- `SSE_RETRY_DELAY_INITIAL = 2.0`, `SSE_RETRY_DELAY_MAX = 60.0`
+- `HEALTH_CHECK_INTERVAL = 30.0`, `HEALTH_CHECK_STALE_THRESHOLD = 120.0`
+
+Signal's `_health_monitor()` calls `_force_reconnect()` on stale SSE — the gateway reconnect watcher applies its own backoff on top.
+
+**Jittered retry backoff** (v0.8.0, PR #6048) applies to model API calls, not platform adapters.
+
+#### 3.3 No Retry Storm Protection
+
+**Gap**: Backoff is deterministic (no jitter) at the platform reconnection layer. `_PAUSE_AFTER_FAILURES = 10` is the only mechanism preventing retry storms. Deterministic backoff could synchronize multiple gateway instances against a degraded platform.
+
+---
+
+### 4. Dead Letter Handling — Failed Message Storage & Alerting
+
+#### 4.1 No Dead Letter Queue in Gateway
+
+**Gap**: No DLQ mechanism exists. When cron delivery fails through both live adapter and standalone fallback paths, error is logged but message content is discarded. `DeliveryRouter._deliver_local()` saves cron output to `{HERMES_HOME}/cron/output/` — only for successful jobs, not failed deliveries.
+
+#### 4.2 Failed Delivery Logging
+
+Cron scheduler logs delivery failures (scheduler.py lines 693-696, 728-731, 748-750) with job ID, platform, chat_id, and error — landing in `errors.log`. There is:
+- No structured failed-message archive
+- No per-delivery retry (only the job itself may retry on next schedule)
+- No alerting beyond log entries
+
+#### 4.3 Non-Retryable Failures
+
+Platforms setting `fatal_error_retryable = False` (e.g., WeCom missing credentials, wecom.py lines 193-208) immediately removed from retry queue and logged. Operators find via `/platform list` or log inspection.
+
+---
+
+### 5. Platform Observability
+
+#### 5.1 Structured Logging per Platform
+
+Every platform logs with platform-specific prefix:
+- Signal: `logger.warning("Signal: health check failed (%d), forcing reconnect", resp.status_code)`
+- WeCom: `logger.error("[%s] Failed to connect: %s", self.name, exc, exc_info=True)`
+- Gateway: `logger.info("✓ %s reconnected successfully", platform.value)`
+
+All routed through `hermes_logging` — `agent.log` (INFO+), `errors.log` (WARNING+).
+
+#### 5.2 Silent Swallow in Status Writes
+
+`BasePlatformAdapter._write_runtime_status_safe()` (base.py lines 1571-1583):
+```python
+try:
+    write_runtime_status(platform=self.platform.value, **kwargs)
+except Exception:
+    pass  # swallow — non-critical diagnostic path
+```
+Platform state transitions may be lost during disk pressure. Same pattern in run.py lines 2685-2686, 2712-2720, 2743-2751 around `_update_platform_runtime_status()` calls.
+
+#### 5.3 No Platform-Level Metrics
+
+No metrics collection (Prometheus, statsd, etc.) for per-platform:
+- Messages received/sent counts
+- Delivery latency
+- Error rates
+- Active sessions
+
+Observability is purely log-based and status-file-based.
+
+---
+
+### 6. Gaps and Issues Identified
+
+| # | Area | Finding | Severity |
+|---|------|---------|----------|
+| P67-1 | Health monitoring | Only Signal has active health-check polling. Telegram, Discord, WhatsApp, etc. have no periodic probes — failures only detected on next message or exception. | Medium |
+| P67-2 | Silent swallow | `_write_runtime_status_safe()` and `_update_platform_runtime_status()` use bare `except Exception: pass` — state transitions may be lost. | Low |
+| P67-3 | No dead letter queue | Failed message content logged but not stored/archived/replayed. No DLQ. | Medium |
+| P67-4 | No alerting | Platform failures generate log entries only. No webhook/email/PagerDuty alerting. | Medium |
+| P67-5 | No retry jitter | Platform reconnect backoff is deterministic — retry storm risk if multiple instances share degraded state. | Low |
+| P67-6 | No per-platform backoff config | All platforms share same `_BACKOFF_CAP=300`, `_PAUSE_AFTER_FAILURES=10` — no per-platform tuning. | Low |
+| P67-7 | No platform metrics | No Prometheus/statsd for message counts, latency, error rates per platform. | Low |
+
+---
+
+### Summary
+
+| Area | Assessment |
+|------|-----------|
+| Health monitoring | Partial — Signal has active probing; others rely on connection activity |
+| Circuit breaker | Well-implemented — per-platform pause/resume, exponential backoff, manual override |
+| Graceful degradation | Good — one platform failure doesn't crash gateway; others continue; cron stays alive |
+| Retry logic | Adequate — exponential backoff, deterministic; no jitter (minor gap) |
+| Dead letter handling | Absent — failed messages logged, not stored or replayed |
+| Observability | Log-based + runtime status file; no structured metrics; status writes silently swallow errors |
+
+*Pass #67 complete — 2026-05-25*
