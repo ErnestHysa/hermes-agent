@@ -5611,3 +5611,226 @@ Failed jobs deliver an error alert (not silent skip). `last_delivery_error` is p
 **No critical issues found. 1 informational note (hermes_time cache invalidation on config reload).**
 
 *Pass #56 complete — 0 new critical findings, 1 informational.*
+
+## Pass #57 – Database Migrations, Schema & Data Integrity Deep Dive – 2026-05-24T20:15:00Z
+
+Scope: hermes_state.py (SessionDB), hermes_cli/kanban_db.py, tests/test_hermes_state.py
+
+---
+
+### P57-1 · Schema migrations: declarative column reconciliation is solid, but v10/v11 backfills are not idempotent — LOW
+
+**File:** `hermes_state.py` (`_init_schema`, lines 552–693)
+
+**What works:**
+- Column additions use the declarative reconciliation pattern (`_reconcile_columns`): diffs live columns vs `SCHEMA_SQL` and issues `ALTER TABLE ADD COLUMN` for anything missing. This is self-healing even if version-gated migration blocks are skipped or reordered. No version-gated blocks needed for ADD COLUMN operations.
+- `schema_version` table is used only for data migrations that can't be expressed declaratively (row backfills, index changes).
+- `SCHEMA_VERSION = 13` is the current version.
+
+**Issue — v10/v11 backfill lacks idempotency guard:**
+The v10 (trigram FTS5 backfill) and v11 (re-index FTS5, switch to inline mode) migrations backfill existing rows into the FTS tables unconditionally when `current_version < 10` or `current_version < 11`. These backfills are inside the version-gated chain but they run `INSERT INTO ... SELECT FROM messages` without a "has this been done already?" check.
+
+```
+if current_version < 10:
+    ...
+    cursor.execute(
+        "INSERT INTO messages_fts_trigram(rowid, content) "
+        "SELECT id, content FROM messages WHERE content IS NOT NULL"
+    )
+if current_version < 11:
+    ...
+    cursor.execute("INSERT INTO messages_fts ...")
+    cursor.execute("INSERT INTO messages_fts_trigram ...")
+```
+
+If a v10 migration partially ran (some rows were indexed, process crashed), re-running will duplicate rows in the FTS tables. `messages_fts` and `messages_fts_trigram` have no `UNIQUE` constraint on `rowid`, so the `INSERT INTO ... SELECT` can create duplicate FTS entries.
+
+**Impact:** Low — this would only affect legacy DBs that ran a v10/v11 migration before schema version tracking was more carefully managed. Modern DBs with `current_version >= 13` never hit this path.
+
+**Recommendation:** Add an existence check before each backfill insert, e.g.:
+```python
+if not _fts_trigram_exists:
+    cursor.execute("SELECT 1 FROM messages LIMIT 1")
+    if cursor.fetchone() is not None:
+        cursor.executescript(FTS_TRIGRAM_SQL)
+        ...
+```
+
+---
+
+### P57-2 · WAL mode: correct configuration with NFS fallback — EXCELLENT
+
+**File:** `hermes_state.py` (`apply_wal_with_fallback`, lines 128–183)
+
+WAL mode is properly configured:
+- `PRAGMA journal_mode=WAL` is attempted on every new connection.
+- On NFS/SMB/FUSE where WAL raises `SQLITE_PROTOCOL`, falls back to `journal_mode=DELETE` with one deduplicated WARNING per process per database label.
+- WAL-incompatibility detection uses a set of known error substrings: `"locking protocol"`, `"not authorized"`, `"disk i/o error"`.
+- `PRAGMA foreign_keys=ON` is set on every connection.
+
+**WAL checkpoint strategy:**
+- `_try_wal_checkpoint()` runs a PASSIVE checkpoint every `_CHECKPOINT_EVERY_N_WRITES = 50` successful writes.
+- `close()` also does a PASSIVE checkpoint before closing.
+- `vacuum()` uses `PRAGMA wal_checkpoint(TRUNCATE)` before `VACUUM` — TRUNCATE is safe outside a transaction and also truncates the WAL file.
+
+**No issues found.** The WAL implementation is thorough, with good NFS compatibility handling and proper checkpoint timing.
+
+---
+
+### P57-3 · SQLite optimization: good index coverage, two queries do full scans — LOW
+
+**File:** `hermes_state.py`
+
+**Existing indexes (sufficient):**
+- `idx_sessions_source` on `sessions(source)`
+- `idx_sessions_parent` on `sessions(parent_session_id)`
+- `idx_sessions_started` on `sessions(started_at DESC)`
+- `idx_messages_session` on `messages(session_id, timestamp)`
+- `idx_messages_platform_msg_id` partial on `messages(session_id, platform_message_id) WHERE platform_message_id IS NOT NULL`
+- `idx_sessions_title_unique` partial unique on `sessions(title) WHERE title IS NOT NULL`
+- `idx_telegram_dm_topic_bindings_session` on `telegram_dm_topic_bindings(session_id)` (CASCADE FK)
+- `idx_telegram_dm_topic_bindings_user` on `telegram_dm_topic_bindings(user_id, chat_id)`
+
+**Two queries do full scans — LOW severity:**
+
+1. `resolve_session_id` (lines 956–981): when session_id is not found exactly, does `LIKE ? ESCAPE '\'` with prefix. This is an index range scan on `started_at DESC`, not a full table scan. Acceptable for prefix resolution.
+
+2. `resolve_resume_session_id` (lines 1851–1914): walks up to 32 levels of parent_session_id chain, doing `SELECT id FROM sessions WHERE parent_session_id = ? ORDER BY started_at DESC LIMIT 1` per level. Each lookup uses `idx_sessions_parent` index. Not a full scan — minor concern is the 32 sequential index lookups, but the parent chain is shallow and bounded.
+
+**Missing indexes:** None critical. The only query that could be a concern is the LIKE-based prefix session lookup, but it uses the `started_at DESC` index with the prefix. For very large session counts it could degrade, but it's not a blocking issue.
+
+---
+
+### P57-4 · Foreign key enforcement: ON DELETE CASCADE on topic bindings, but main tables rely on application-level cascades — LOW
+
+**File:** `hermes_state.py`
+
+**What's enforced:**
+- `sessions.parent_session_id REFERENCES sessions(id)` — FK without `ON DELETE` clause. Deleting a parent session does NOT automatically cascade to children. Application-level cleanup is used: `prune_sessions` first nullifies `parent_session_id` on children before deleting parents (line 2615).
+- `messages.session_id REFERENCES sessions(id)` — FK without `ON DELETE` clause. Deleting a session does NOT automatically delete messages. Again handled at application level: `prune_sessions` deletes messages row-by-row before deleting the session (line 2622).
+- `telegram_dm_topic_bindings.session_id REFERENCES sessions(id) ON DELETE CASCADE` — properly declared with CASCADE. This was a v2 migration fix (line 2704–2745).
+
+**Why this is acceptable:**
+- The application-level delete ordering in `prune_sessions` is correct: children updated first, messages deleted, then parent. This prevents FK violations.
+- The absence of FK cascades on `sessions.parent_session_id` and `messages.session_id` is a design choice: it prevents accidental cascade deletion of child sessions and allows the compression-split pattern (parent ends, child continues) to work safely.
+- `PRAGMA foreign_keys=ON` is correctly set on every connection.
+
+**The Telegram topic binding FK (ON DELETE CASCADE) is correctly implemented and was a deliberate fix from v1 to v2 of that schema.**
+
+---
+
+### P57-5 · Transaction isolation: BEGIN IMMEDIATE + jitter retry is well-implemented — GOOD
+
+**File:** `hermes_state.py` (`_execute_write`, lines 377–427)
+
+- `isolation_level=None` (autocommit OFF, we manage transactions ourselves).
+- Every write starts with `BEGIN IMMEDIATE` — acquires WAL write lock at transaction start (not at commit time), so lock contention surfaces immediately.
+- On `database is locked` or `busy`, retries up to `_WRITE_MAX_RETRIES = 15` with random jitter between 20ms–150ms. Jitter breaks the SQLite deterministic backoff convoy pattern.
+- After a successful write, periodic PASSIVE WAL checkpoint every 50 writes.
+- All read operations use `with self._lock:` but read without `BEGIN` — they use SQLite's default autocommit behavior which in WAL mode allows concurrent readers even during a write transaction.
+
+**Minor observation:** Read methods (`get_session`, `get_messages`, `search_messages`) hold `self._lock` for the duration of the SQLite query. Under high write throughput, readers may be blocked waiting for the lock while `_execute_write` is in progress. For the gateway's concurrent reader pattern this is acceptable, but it's worth noting that the lock is coarse-grained — it covers the entire SQLite execute/fetch cycle.
+
+---
+
+### P57-6 · NULL handling: safe, with sentinel prefix for structured content — GOOD
+
+**File:** `hermes_state.py` (`_encode_content`, `_decode_content`, lines 1412–1446)
+
+- Multimodal message content (list/dict) is JSON-encoded with a NUL-byte sentinel prefix (`\x00json:`) to distinguish structured content from plain strings.
+- Reading: `_decode_content` checks for the sentinel and decodes; scalars returned unchanged.
+- FTS triggers use `COALESCE(new.content, '')` to handle NULL content.
+- `list_unlinked_telegram_sessions_for_user` uses `COALESCE(..., '')` for preview extraction subqueries.
+- No NULL-related integrity issues found.
+
+---
+
+### P57-7 · Database backup: no built-in backup/restore mechanism for state.db — INFORMATIONAL
+
+**File:** `hermes_state.py`
+
+**What exists:**
+- `vacuum()` method (lines 3084–3105) for space reclamation after large deletes.
+- `maybe_auto_prune_and_vacuum()` (lines 3107–3178) for automated maintenance.
+- `kanban_db.py` has a `_backup_corrupt_db()` function that copies a corrupt DB (and WAL/SHM sidecars) to a timestamped backup when corruption is detected at open time. This is reactive, not proactive backup.
+
+**What is absent:**
+- No `sqlite3.Connection.backup()` API usage for live hot-backup of `state.db`.
+- No `hermes backup` or `hermes restore` CLI command.
+- No backup rotation, backup validation, or off-host copy mechanism.
+- The `maybe_auto_prune_and_vacuum` method only records a timestamp in `state_meta`; it is not a backup.
+- Sessions directory (on-disk JSONL transcript files) is cleaned up (`_remove_session_files`) but not backed up.
+
+**Note:** The `telegram_dm_topic_bindings` table has `ON DELETE CASCADE` for its FK to `sessions`, so Telegram topic binding cleanup is automatic when sessions are pruned. The `sessions`→`messages` relationship is handled by the `prune_sessions` application-level cascade.
+
+**Risk:** If `state.db` becomes corrupted or the disk fails, there is no point-in-time backup. The WAL file (`state.db-wal`) provides some durability in WAL mode (committed writes are in the WAL before being checkpointed to the main file), but this is not equivalent to a verified backup.
+
+---
+
+### P57-8 · Schema version tracking: version exists but v10/v11 migrations lack re-run guards — LOW
+
+**File:** `hermes_state.py` (lines 590–670), `tests/test_hermes_state.py`
+
+**What works:**
+- `schema_version` table with a single integer row tracks the current schema version.
+- On fresh DB: `INSERT INTO schema_version (version) VALUES (SCHEMA_VERSION)`.
+- On upgrade: `UPDATE schema_version SET version = ? WHERE version < SCHEMA_VERSION`.
+- Version-gated chain for v10 and v11 FTS backfills.
+
+**Test coverage:** `test_hermes_state.py` is comprehensive (3023 lines) covering session lifecycle, message storage, FTS search, token counting, pruning, topic binding, and export. No migration-specific tests exist for v10/v11 backfill re-run safety, but given current_version >= 13 on new DBs, this path is not exercised in normal use.
+
+---
+
+### P57-9 · `end_session` first-end-reason-wins is correctly implemented — GOOD
+
+**File:** `hermes_state.py` (lines 732–748)
+
+The `UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL` pattern ensures the first `end_reason` is preserved — compression-split sessions keep their `'compression'` reason even if a desynced CLI calls `end_session` again. Tests confirm this: `test_end_session_preserves_original_end_reason` and `test_end_session_after_reopen_allows_re_end`.
+
+---
+
+### P57-10 · CJK/FTS5 search: trigram tokenizer correctly used as primary, unicode61 as fallback — GOOD
+
+**File:** `hermes_state.py` (lines 280–308, 2099–2340)
+
+- `messages_fts` uses default unicode61 tokenizer — good for English/Latin-script prefix matching.
+- `messages_fts_trigram` uses `tokenize='trigram'` — good for CJK substring matching and phrase matching.
+- Query routing: if query has ≥3 CJK characters, uses trigram table; otherwise uses standard FTS5.
+- Short CJK fallback (1-2 chars): uses LIKE substring search on `messages.content` — full table scan but acceptable for short queries.
+- Per-token length check (#20494 fix): if any non-operator CJK token is <3 chars, routes to LIKE even if overall CJK count ≥3.
+
+**No issues found.** The dual-FTS5-table approach with trigram is a solid pattern for multilingual FTS.
+
+---
+
+### P57-11 · WAL edge case: passive checkpoint may not reclaim WAL space under sustained write load — INFORMATIONAL
+
+**File:** `hermes_state.py` (`_try_wal_checkpoint`, lines 429–448)
+
+- `_CHECKPOINT_EVERY_N_WRITES = 50` — a PASSIVE checkpoint runs every 50 writes.
+- PASSIVE checkpoint only checkpoints frames that no other connection is holding. Under high concurrency (many persistent connections), a PASSIVE checkpoint may checkpoint few or zero frames.
+- `vacuum()` uses `TRUNCATE` checkpoint, which is more aggressive and also truncates the WAL file.
+- `maybe_auto_prune_and_vacuum` only runs VACUUM if `pruned > 0` — if no sessions were pruned, no VACUUM.
+
+**Observation:** Under a heavy sustained write workload with many active reader connections, the WAL file (`state.db-wal`) could grow large and not be fully reclaimed by PASSIVE checkpoints. The TRUNCATE checkpoint in `vacuum()` would reclaim space, but only runs after pruning. A periodic TRUNCATE checkpoint (e.g., every N writes regardless of pruning) might be beneficial for long-running gateway processes that don't frequently prune sessions.
+
+This is informational — not a bug, but a potential tuning knob for very high-load deployments.
+
+---
+
+### Summary
+
+| Area | Status | Severity |
+|------|--------|----------|
+| Schema migrations | Declarative reconciliation is excellent; v10/v11 backfills lack idempotency guards | LOW |
+| WAL mode | Correct config + NFS fallback + proper checkpoint strategy | GOOD |
+| Index coverage | Good; no critical full-table scans | LOW |
+| Foreign key enforcement | Partial: topic bindings use CASCADE; main tables use app-level cascade (acceptable) | LOW |
+| Transaction isolation | BEGIN IMMEDIATE + jitter retry is well-implemented | GOOD |
+| NULL handling | Safe sentinel prefix encoding for structured content | GOOD |
+| Database backup | Absent for state.db; kanban.db has corrupt-DB reactive backup | INFORMATIONAL |
+| Schema version tracking | Version table present; v10/v11 backfills lack re-run guards | LOW |
+| CJK FTS search | Dual-table trigram + unicode61 correctly routed | GOOD |
+| WAL checkpoint edge case | Passive checkpoint may not reclaim WAL under sustained write load | INFORMATIONAL |
+
+**No critical issues found. 2 informational notes, 6 low-severity observations, 4 areas rated GOOD/EXCELLENT.**
