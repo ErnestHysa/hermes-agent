@@ -7234,3 +7234,254 @@ OAuth callback server binds to `localhost` only with ephemeral port. Tokens stor
 **File:** `tools/environments/local.py:79-170`
 
 Blocklist covers provider API keys, messaging tokens, email credentials, GitHub tokens. Dynamic derivation from `PROVIDER_REGISTRY.api_key_env_vars` and `OPTIONAL_ENV_VARS` means new providers automatically get added. Well architected.
+
+## Pass #66 – WebSocket, SSE & Real-Time Communication Deep Dive – 2026-05-24T23:00:00Z
+
+---
+
+### 1. WebSocket Security
+
+#### 1a. tui_gateway/ws.py — No Origin Validation, No Auth on Socket
+
+ at line 116 calls  unconditionally. There is:
+- **No origin header check** before accepting the connection.
+- **No WebSocket-level authentication** — the only auth is the JSON-RPC dispatch inside , which requires an already-established connection.
+- **No rate limiting** on number of concurrent WS connections (the  is a write-deadlock guard, not a connection cap).
+
+Risk: Any local process or browser on the same machine can open arbitrary WS connections to the tui_gateway and send JSON-RPC commands. This is partially mitigated by the fact that tui_gateway is spawned as a private subprocess by the TUI, not bound to a public port.
+
+#### 1b. hermes_cli/web_server.py — Proper Origin + Host + Token Guard
+
+The dashboard WebSocket endpoints use  (line 3337), which chains:
+-  (line 3309): checks Host header matches bound dashboard host AND validates Origin header if present.
+-  (line 3298): requires loopback IP only.
+- HMAC token validation via  (timing-safe).
+
+Tests confirm cross-origin requests get code 4403. Well-hardened for the dashboard use case.
+
+#### 1c. Platform WebSocket (wecom, feishu)
+
+- **wecom.py**: Outbound WS to vendor servers. Authentication inside the WS session via signed subscribe command. Has application-level heartbeat (30s) + aiohttp heartbeat (60s). Reconnect with exponential backoff (5-entry table, 30s max).
+- **feishu.py**: App-level scoped lock prevents duplicate instances. WebSocket thread cleanup with 10s timeout. Supports both websocket and webhook modes.
+
+#### 1d. Rate Limiting on Connections
+
+- **No per-WS-connection rate limiting** in .
+- Rate limiting exists at pairing level (platform+userId) in .
+- API server uses thread pool for long handlers but no connection-level rate limiting.
+
+---
+
+### 2. SSE Implementation (api_server.py)
+
+#### 2a. Reconnection
+
+SSE endpoint . No Last-Event-ID / resume mechanism. Clients that lose the stream must re-request from start. Known limitation.
+
+#### 2b. Message Ordering
+
+SSE backed by  per . Producer puts deltas; reader loop reads with 0.5s timeout. Drain loop on completion processes remaining items. Ordering preserved per-queue.
+
+#### 2c. Memory Leaks
+
+ (Queue) +  (timestamps). Background task sweeps every 60s, removes streams older than  (300s), cancelling associated tasks. Adequate orphan cleanup.
+
+Potential: unbounded Queue — if client disconnects but agent keeps producing, queue could grow. However agent is interrupted on client disconnect.
+
+---
+
+### 3. Real-Time Protocol Security
+
+#### 3a. Message Injection — tui_gateway/ws.py
+
+All frames pass  then  (validates method string, params object). Injection via malformed JSON prevented. Valid requests go through .
+
+#### 3b. Cross-Site WS Hijacking — tui_gateway
+
+**No Origin validation.** Any cross-origin site that can reach the port can open a WS. Since tui_gateway is typically a subprocess pipe, practical risk is limited to same-machine attackers.
+
+ properly protected (see 1b).
+
+#### 3c. CSRF on SSE — api_server.py
+
+Bearer token required ( at line 770). CORS headers added based on . If  in origins,  is sent; otherwise origin is checked and  included.
+
+---
+
+### 4. Connection Management
+
+#### 4a. Stale Connection Detection
+
+- **WeCom**: aiohttp heartbeat (60s interval) + application ping every 30s via . Abnormal close triggers  exception and reconnect.
+- **Feishu**: Scoped lock detects duplicate instances. WS thread cancelled with 10s timeout.
+- **api_server SSE**: 30s keepalive via  SSE comment when no deltas arrive.
+
+#### 4b. Timeouts
+
+- WeCom:  (30s) for ws_connect.
+- Feishu WS thread: 10s shutdown timeout.
+- tui_gateway WS write: .
+- Slash worker: .
+
+#### 4c. Cleanup on Disconnect
+
+**tui_gateway/ws.py** (finally block, lines 166-178):
+- 
+- Replaces owned session transport with  fallback
+- 
+
+**SSE**: On /:  + . Good.
+
+---
+
+### 5. WebSocket Compression — CRIME/BREACH
+
+**No  or WebSocket-level compression** in any WS implementation. Plain JSON text frames. Platform WS connections are opaque tunnels over aiohttp default stack. CRIME/BREACH not applicable.
+
+---
+
+### Summary
+
+| Area | Finding | Severity |
+|------|---------|----------|
+|  origin validation | None —  unconditional | Medium (subprocess-only access limits exposure) |
+|  WS origin | Proper: host + origin + loopback IP + HMAC | Low |
+|  auth | JSON-RPC dispatch only; no WS-level auth | Low (subprocess isolation) |
+|  rate limiting | None on WS connections | Low |
+| SSE reconnection | No Last-Event-ID / resume | Low (known limitation) |
+| SSE orphan cleanup | 60s sweep, 5m TTL, adequate | Low |
+| SSE client disconnect | Agent interrupt + task cancellation | Good |
+| Cross-site WS hijacking (tui_gateway) | Possible if TCP port exposed | Medium |
+| Platform WS (wecom, feishu) | Outbound; properly managed | Low |
+| WebSocket compression | Not used — CRIME/BREACH N/A | N/A |
+| Connection cleanup | Thorough transport replacement | Good |
+
+---
+
+*Pass #66 complete — 2026-05-24*
+
+
+## Pass #66 – WebSocket, SSE & Real-Time Communication Deep Dive – 2026-05-24T23:00:00Z
+
+---
+
+### 1. WebSocket Security
+
+#### 1a. tui_gateway/ws.py — No Origin Validation, No Auth on Socket
+
+`handle_ws()` at line 116 calls `ws.accept()` unconditionally. There is:
+- **No origin header check** before accepting the connection.
+- **No WebSocket-level authentication** — the only auth is the JSON-RPC dispatch inside `server.dispatch`, which requires an already-established connection.
+- **No rate limiting** on number of concurrent WS connections (the `_WS_WRITE_TIMEOUT_S` is a write-deadlock guard, not a connection cap).
+
+Risk: Any local process or browser on the same machine can open arbitrary WS connections to the tui_gateway and send JSON-RPC commands. This is partially mitigated by the fact that tui_gateway is spawned as a private subprocess by the TUI, not bound to a public port.
+
+#### 1b. hermes_cli/web_server.py — Proper Origin + Host + Token Guard
+
+The dashboard WebSocket endpoints use `_ws_request_is_allowed()` (line 3337), which chains:
+- `_ws_host_origin_is_allowed()` (line 3309): checks Host header matches bound dashboard host AND validates Origin header if present.
+- `_ws_client_is_allowed()` (line 3298): requires loopback IP only.
+- HMAC token validation via `hmac.compare_digest` (timing-safe).
+
+Tests confirm cross-origin requests get code 4403. Well-hardened for the dashboard use case.
+
+#### 1c. Platform WebSocket (wecom, feishu)
+
+- **wecom.py**: Outbound WS to vendor servers. Authentication inside the WS session via signed subscribe command. Has application-level heartbeat (30s) + aiohttp heartbeat (60s). Reconnect with exponential backoff (5-entry table, 30s max).
+- **feishu.py**: App-level scoped lock prevents duplicate instances. WebSocket thread cleanup with 10s timeout. Supports both websocket and webhook modes.
+
+#### 1d. Rate Limiting on Connections
+
+- **No per-WS-connection rate limiting** in `tui_gateway/ws.py`.
+- Rate limiting exists at pairing level (platform+userId) in `gateway/pairing.py`.
+- API server uses thread pool for long handlers but no connection-level rate limiting.
+
+---
+
+### 2. SSE Implementation (api_server.py)
+
+#### 2a. Reconnection
+
+SSE endpoint `/v1/runs/{run_id}/events`. No Last-Event-ID / resume mechanism. Clients that lose the stream must re-request from start. Known limitation.
+
+#### 2b. Message Ordering
+
+SSE backed by `asyncio.Queue` per `run_id`. Producer puts deltas; reader loop reads with 0.5s timeout. Drain loop on completion processes remaining items. Ordering preserved per-queue.
+
+#### 2c. Memory Leaks
+
+`_run_streams` (Queue) + `_run_streams_created` (timestamps). Background task sweeps every 60s, removes streams older than `_RUN_STREAM_TTL` (300s), cancelling associated tasks. Adequate orphan cleanup.
+
+Potential: unbounded Queue — if client disconnects but agent keeps producing, queue could grow. However agent is interrupted on client disconnect.
+
+---
+
+### 3. Real-Time Protocol Security
+
+#### 3a. Message Injection — tui_gateway/ws.py
+
+All frames pass `json.loads()` then `_normalize_request()` (validates method string, params object). Injection via malformed JSON prevented. Valid requests go through `server.dispatch()`.
+
+#### 3b. Cross-Site WS Hijacking — tui_gateway
+
+**No Origin validation.** Any cross-origin site that can reach the port can open a WS. Since tui_gateway is typically a subprocess pipe, practical risk is limited to same-machine attackers.
+
+`hermes_cli/web_server.py` properly protected (see 1b).
+
+#### 3c. CSRF on SSE — api_server.py
+
+Bearer token required (`_check_auth()` at line 770). CORS headers added based on `_cors_origins`. If `*` in origins, `Access-Control-Allow-Origin: *` is sent; otherwise origin is checked and `Vary: Origin` included.
+
+---
+
+### 4. Connection Management
+
+#### 4a. Stale Connection Detection
+
+- **WeCom**: aiohttp heartbeat (60s interval) + application ping every 30s via `_heartbeat_loop()`. Abnormal close triggers `_listen_loop` exception and reconnect.
+- **Feishu**: Scoped lock detects duplicate instances. WS thread cancelled with 10s timeout.
+- **api_server SSE**: 30s keepalive via `: keepalive` SSE comment when no deltas arrive.
+
+#### 4b. Timeouts
+
+- WeCom: `CONNECT_TIMEOUT_SECONDS` (30s) for ws_connect.
+- Feishu WS thread: 10s shutdown timeout.
+- tui_gateway WS write: `_WS_WRITE_TIMEOUT_S = 10.0`.
+- Slash worker: `_SLASH_WORKER_TIMEOUT_S = 45.0`.
+
+#### 4c. Cleanup on Disconnect
+
+**tui_gateway/ws.py** (finally block, lines 166-178):
+- `transport.close()`
+- Replaces owned session transport with `_stdio_transport` fallback
+- `ws.close()`
+
+**SSE**: On `ConnectionResetError`/`BrokenPipeError`: `agent.interrupt()` + `agent_task.cancel()`. Good.
+
+---
+
+### 5. WebSocket Compression — CRIME/BREACH
+
+**No `permessage-deflate` or WebSocket-level compression** in any WS implementation. Plain JSON text frames. Platform WS connections are opaque tunnels over aiohttp default stack. CRIME/BREACH not applicable.
+
+---
+
+### Summary
+
+| Area | Finding | Severity |
+|------|---------|----------|
+| `tui_gateway/ws.py` origin validation | None — `ws.accept()` unconditional | Medium (subprocess-only access limits exposure) |
+| `hermes_cli/web_server.py` WS origin | Proper: host + origin + loopback IP + HMAC | Low |
+| `tui_gateway/ws.py` auth | JSON-RPC dispatch only; no WS-level auth | Low (subprocess isolation) |
+| `tui_gateway/ws.py` rate limiting | None on WS connections | Low |
+| SSE reconnection | No Last-Event-ID / resume | Low (known limitation) |
+| SSE orphan cleanup | 60s sweep, 5m TTL, adequate | Low |
+| SSE client disconnect | Agent interrupt + task cancellation | Good |
+| Cross-site WS hijacking (tui_gateway) | Possible if TCP port exposed | Medium |
+| Platform WS (wecom, feishu) | Outbound; properly managed | Low |
+| WebSocket compression | Not used — CRIME/BREACH N/A | N/A |
+| Connection cleanup | Thorough transport replacement | Good |
+
+---
+
+*Pass #66 complete — 2026-05-24*
