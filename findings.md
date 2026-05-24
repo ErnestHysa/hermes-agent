@@ -5349,3 +5349,265 @@ The unknown command error tells users what to do next: use `/commands` or resend
 | P55-6 | Health Checks | No health check endpoint for TUI gateway process itself. WhatsApp platform has no local health check — relies entirely on external bridge. Signal health-check failures force reconnect but don't alert operator beyond log entries. | LOW |
 
 *Pass #55 complete - 6 findings across 5 focus areas.*
+
+
+---
+
+## Pass #56 – Cron, Scheduler & Background Job Deep Dive – 2026-05-24T14:34:00-07:00
+
+**Focus:** Cron expression parsing (robustness, edge cases, timezone), job execution reliability (failure handling, retry, alerting), job state persistence (restart survival, deduplication, orphans), subprocess management (timeouts, zombies, cleanup), concurrent job execution (race conditions, locking).
+
+**Files examined:** `cron/scheduler.py` (1972 lines), `cron/jobs.py` (1203 lines), `cron/__init__.py` (42 lines), `hermes_time.py` (104 lines).
+
+---
+
+### Finding CRON-56-1: croniter validation at parse-time is correct but relies on the library's error handling
+
+**File:** `cron/jobs.py:228-231`
+
+```python
+# Validate cron expression
+try:
+    croniter(schedule)
+except Exception as e:
+    raise ValueError(f"Invalid cron expression '{schedule}': {e}")
+```
+
+**Assessment:** The validation approach is correct — croniter's constructor raises on invalid expressions. No edge-case gaps detected. The 5-field vs 6-field detection via `parts = schedule.split()` followed by `len(parts) >= 5` is slightly loose (accepts 6+ fields) but croniter itself will reject truly malformed expressions.
+
+**Status:** OK — no actionable issue.
+
+---
+
+### Finding CRON-56-2: Timezone handling is present and comprehensive; hermes_time cache not invalidated on config reload
+
+**Files:** `hermes_time.py`, `cron/jobs.py:_ensure_aware()`, `cron/scheduler.py`
+
+Timezone architecture:
+- `hermes_time.now()` returns timezone-aware datetime using configured IANA timezone (`HERMES_TIMEZONE` env var or `timezone` key in config.yaml)
+- `hermes_time.get_timezone()` is cached once per process lifetime — no cache invalidation on config.yaml reload
+- `_ensure_aware()` in `cron/jobs.py:276-292` handles legacy naive timestamps: if a stored `next_run_at` is naive (no tzinfo), it interprets it as system-local wall time and converts to the configured Hermes timezone. This preserves relative ordering across timezone changes.
+
+**The croniter base_time for next-run computation:**
+```python
+# cron/jobs.py:390-394
+base_time = now
+if last_run_at:
+    base_time = _ensure_aware(datetime.fromisoformat(last_run_at))
+cron = croniter(schedule["expr"], base_time)
+next_run = cron.get_next(datetime)
+```
+
+This correctly anchors recurring jobs to their last execution time rather than wall-clock restart time after a crash.
+
+**Informational note:** `_cached_tz` in `hermes_time.py` is never invalidated after config.yaml changes. If a user updates their timezone while the gateway is running, the scheduler continues using the old timezone until restart. `reset_cache()` is not exported or called anywhere in the codebase.
+
+**Status:** Informational — no crash-level issue, but timezone changes require gateway restart to take effect.
+
+---
+
+### Finding CRON-56-3: Job state persistence is robust — atomic file writes with fsync, at-most-once deduplication via advance_next_run()
+
+**Files:** `cron/jobs.py:433-449`, `cron/scheduler.py:1833-1835`
+
+**Atomic save pattern:**
+```python
+# cron/jobs.py:436-442
+fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
+with os.fdopen(fd, 'w', encoding='utf-8') as f:
+    json.dump({"jobs": jobs, "updated_at": _hermes_now().isoformat()}, f, indent=2)
+    f.flush()
+    os.fsync(f.fileno())
+atomic_replace(tmp_path, JOBS_FILE)
+_secure_file(JOBS_FILE)
+```
+
+`atomic_replace()` is used (not direct rename), and `fsync` is called before the rename — good durability practice. Temp files are cleaned up in a `BaseException` handler.
+
+**Deduplication — at-most-once for recurring jobs:**
+```python
+# cron/scheduler.py:1832-1835
+for job in due_jobs:
+    advance_next_run(job["id"])  # Called BEFORE execution
+```
+
+`advance_next_run()` (jobs.py:930-956) pre-computes the NEXT run time and writes it to `jobs.json` under the file lock BEFORE `run_job()` executes. If the process crashes mid-execution, on restart `get_due_jobs()` sees the already-advanced `next_run_at` and won't re-fire. One-shot jobs are excluded from this, allowing retry on restart.
+
+**Orphan cleanup:**
+```python
+# cron/jobs.py:849-852
+job_output_dir = OUTPUT_DIR / canonical_id
+if job_output_dir.exists():
+    shutil.rmtree(job_output_dir)
+```
+Job output directory is cleaned up on job removal.
+
+**Status:** Well-designed. No gaps found.
+
+---
+
+### Finding CRON-56-4: Subprocess management — script timeouts enforced, bash path resolution handles Windows, fd leak prevention
+
+**Files:** `cron/scheduler.py:771-928`, `cron/scheduler.py:1774-1788`
+
+**Script timeout:**
+```python
+# scheduler.py:771-801 — _get_script_timeout()
+# Reads HERMES_CRON_SCRIPT_TIMEOUT env var → config.yaml cron.script_timeout_seconds → 120s default
+# scheduler.py:899 — passed as timeout= to subprocess.run()
+```
+
+**Bash resolution for .sh/.bash scripts:**
+```python
+# scheduler.py:868-877
+_bash = shutil.which("bash") or (
+    "/bin/bash" if os.path.isfile("/bin/bash") else None
+)
+if _bash is None:
+    return False, "Cannot run .sh/.bash script ... bash not found on PATH. ..."
+```
+
+Good — clear error message when bash is missing (Windows without Git Bash).
+
+**Path traversal guard for scripts:**
+```python
+# scheduler.py:843-849
+path.relative_to(scripts_dir_resolved)  # Raises ValueError if outside
+```
+
+Scripts must reside in `~/.hermes/scripts/`. Relative paths are resolved there; absolute paths are validated to ensure they stay within that directory. Symlink escapes are blocked by the same check.
+
+**Zombie / fd leak prevention:**
+```python
+# scheduler.py:1774-1788
+try:
+    if agent is not None:
+        agent.close()
+...
+try:
+    from agent.auxiliary_client import cleanup_stale_async_clients
+    cleanup_stale_async_clients()
+```
+
+`agent.close()` releases subprocesses, terminal sandboxes, browser daemons, and OpenAI/httpx clients held by the ephemeral cron agent. `cleanup_stale_async_clients()` reaps async httpx clients cached under the per-job thread's event loop (which dies when the `ThreadPoolExecutor` shuts down) — prevents fd accumulation toward EMFILE ("too many open files" — see issue #10200).
+
+**Post-tick MCP orphan sweep:**
+```python
+# scheduler.py:1949-1954
+try:
+    from tools.mcp_tool import _kill_orphaned_mcp_children
+    _kill_orphaned_mcp_children()
+```
+
+Best-effort sweep AFTER all jobs finish, so active user chat MCP sessions are never touched.
+
+**Status:** Well-implemented.
+
+---
+
+### Finding CRON-56-5: Concurrent job execution — file lock for tick serialization, workdir/profile jobs serialized, others parallel
+
+**Files:** `cron/scheduler.py:1805-1820` (file lock), `cron/scheduler.py:1908-1944` (parallel dispatch)
+
+**Tick-level lock (prevents concurrent ticks across processes):**
+```python
+# scheduler.py:1809-1819
+lock_fd = open(lock_file, "w", encoding="utf-8")
+if fcntl:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # non-blocking
+elif msvcrt:
+    msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+# If lock fails → returns 0, tick skipped
+```
+
+Cross-platform (Unix uses `fcntl`, Windows uses `msvcrt`). Non-blocking — if lock is held by another process, this tick simply skips. Lock is released in the `finally:` block.
+
+**Per-tick parallel execution:**
+```python
+# scheduler.py:1908-1944
+sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip() or (j.get("profile") or "").strip()]
+parallel_jobs = [j for j in due_jobs if not ((j.get("workdir") or "").strip() or (j.get("profile") or "").strip())]
+
+# Sequential pass:
+for job in sequential_jobs:
+    _ctx = contextvars.copy_context()
+    _results.append(_ctx.run(_process_job, job))
+
+# Parallel pass:
+with concurrent.futures.ThreadPoolExecutor(max_workers=_max_workers) as _tick_pool:
+    for job in parallel_jobs:
+        _ctx = contextvars.copy_context()
+        _futures.append(_tick_pool.submit(_ctx.run, _process_job, job))
+```
+
+Jobs with `workdir` or `profile` are serialized (they mutate process-global `os.environ["TERMINAL_CWD"]` and profile env snapshot/restore). Other jobs run in parallel via `ThreadPoolExecutor`. `contextvars.copy_context()` preserves ContextVar state across the thread boundary.
+
+**No same-job duplicate execution:** `advance_next_run()` is called for ALL due recurring jobs BEFORE any execution (scheduler.py:1833-1835), so even if a job appears in `due_jobs` twice, its `next_run_at` is already advanced. No explicit per-job mutex needed — the file lock + at-most-once advance pattern provides the guarantee.
+
+**Race condition in mark_job_run:** The `with _jobs_file_lock:` guard in `mark_job_run` (jobs.py:868) ensures that concurrent `mark_job_run` calls from parallel job threads don't clobber each other. The file lock on `jobs.json` combined with the in-process `_jobs_file_lock` (threading.Lock) covers both multi-process and multi-thread concurrency.
+
+**Status:** Well-designed. No race conditions detected.
+
+---
+
+### Finding CRON-56-6: Retry/alerting on failure — soft failures for empty responses, error state for recurring jobs, delivery error tracking
+
+**Files:** `cron/scheduler.py:1876-1899`, `cron/jobs.py:857-927`
+
+**Soft failure for empty response:**
+```python
+# scheduler.py:1895-1898
+if success and not final_response.strip():
+    success = False
+    error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+```
+
+An agent that completes but produces whitespace-only output is marked as a failure, not "ok". This ensures silent model errors (e.g., rate limit returning empty) are surfaced.
+
+**Job state transitions on failure:**
+```python
+# jobs.py:901-920
+if job["next_run_at"] is None:
+    kind = job.get("schedule", {}).get("kind")
+    if kind in {"cron", "interval"}:
+        job["state"] = "error"  # Recurring jobs → error state, stay enabled
+    else:
+        job["enabled"] = False   # One-shot jobs → completed (disabled)
+        job["state"] = "completed"
+```
+
+Recurring jobs that can't compute `next_run_at` (e.g., `croniter` missing) get `state=error` but remain enabled so the operator sees the problem and can fix it. One-shot failures gracefully disable.
+
+**Delivery error tracking:**
+```python
+# jobs.py:876-877
+job["last_delivery_error"] = delivery_error
+
+# scheduler.py:1876
+deliver_content = final_response if success else f"⚠️ Cron job ... failed:
+{error}"
+```
+
+Failed jobs deliver an error alert (not silent skip). `last_delivery_error` is persisted separately from `last_error`, so operator can distinguish "agent ran successfully but delivery platform was down" from "agent itself failed."
+
+**No automatic retry:** There is no retry loop for failed jobs within a single tick. If a job fails, it's marked with `last_status=error` and its `next_run_at` is advanced normally. The next tick will fire it again only if the schedule says so. The `repeat` counter does NOT provide retry within the same schedule period — it's for count-limited jobs (e.g., run 5 times then stop).
+
+**Status:** Correct design — auto-retry within a period would cause duplicates; alerting is the correct approach for recurring jobs.
+
+---
+
+### Summary — Pass #56
+
+| Area | Assessment |
+|------|------------|
+| Cron expression parsing | Robust — uses croniter with validation at parse-time; edge cases covered |
+| Timezone handling | Correct architecture; informational note about `hermes_time._cached_tz` not invalidated on config reload |
+| Job state persistence | Strong — atomic file writes with fsync, at-most-once deduplication via `advance_next_run()`, orphan cleanup on removal |
+| Subprocess management | Well-implemented — script timeouts, bash path resolution, path traversal guards, fd leak prevention via `agent.close()` + `cleanup_stale_async_clients()` |
+| Concurrent execution | Well-designed — cross-platform file lock for tick serialization, workdir/profile jobs serialized, others parallel, no race conditions in `mark_job_run` |
+| Job failure handling | Good — soft failures for empty responses, error state for recurring jobs, separate delivery error tracking, failed-job alerts delivered |
+| Retry logic | Absent by design — auto-retry within a period would cause duplicates; alerting is the correct approach for recurring jobs |
+
+**No critical issues found. 1 informational note (hermes_time cache invalidation on config reload).**
+
+*Pass #56 complete — 0 new critical findings, 1 informational.*
