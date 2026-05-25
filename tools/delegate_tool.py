@@ -1681,6 +1681,12 @@ def _run_single_child(
         _output_tokens = getattr(child, "session_completion_tokens", 0)
         _model = getattr(child, "model", None)
 
+        # P30-1 FIX (audit 100 passes): initialise _files_written here so it
+        # is bound when referenced in the entry dict below.  The real value
+        # (computed via file_state) is assigned again after complete_kwargs
+        # is built, overwriting this placeholder.
+        _files_written: List[str] = []
+
         entry: Dict[str, Any] = {
             "task_index": task_index,
             "status": status,
@@ -1698,6 +1704,10 @@ def _run_single_child(
                 ),
             },
             "tool_trace": tool_trace,
+            # P30-1 FIX (audit 100 passes): include files_written in the entry
+            # dict so on_delegation receives structured audit data, not just a
+            # freeform summary. Previously only complete_kwargs (TUI) got this.
+            "files_written": _files_written,
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
             # Stripped before the dict is serialised back to the model.
@@ -1777,6 +1787,10 @@ def _run_single_child(
                 for p in paths
             }
         )[:40]
+
+        # P30-1 FIX: update entry.files_written now that the real value is
+        # computed — the placeholder [] in the entry dict above gets replaced.
+        entry["files_written"] = _files_written
 
         _output_tail = _extract_output_tail(result, max_entries=8, max_chars=600)
 
@@ -2233,6 +2247,11 @@ def delegate_task(
                         if entry["task_index"] < len(children)
                         else ""
                     ),
+                    # P30-1 FIX (audit 100 passes): pass structured audit data
+                    # so the memory provider can record what the subagent actually
+                    # did (tool calls + files written), not just a freeform summary.
+                    tool_trace=entry.get("tool_trace", []),
+                    files_written=entry.get("files_written", []),
                 )
             except Exception:
                 pass
