@@ -50,6 +50,7 @@ class FailoverReason(enum.Enum):
 
     # Request format
     format_error = "format_error"        # 400 bad request — abort or strip + retry
+    malformed_success = "malformed_success"  # P30-7 FIX: proxy returned HTTP 200 but response body is corrupted/incomplete — retry without this proxy
     multimodal_tool_content_unsupported = "multimodal_tool_content_unsupported"  # Provider rejected list-type content in tool messages (e.g. Xiaomi MiMo) — downgrade to text and retry
 
     # Provider-specific
