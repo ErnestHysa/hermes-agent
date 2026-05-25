@@ -13512,3 +13512,133 @@ Scope: hermes_cli/tui.py, hermes_cli/tui_gateway.py, hermes_cli/chat_ui.py, tool
 
 *Pass #95 complete — 2026-05-26T13:30:00Z*
 *Commit at scan: 5a51a1f65*
+
+---
+
+## Pass #96 – Agentic Workflow Verification, State Machine & Loop Detection Deep Dive – 2026-05-26T14:00:00Z
+
+### 96-1 | Iteration Limits: max_iterations Enforcement
+
+**Component:** `agent/iteration_budget.py` + `agent/conversation_loop.py`
+
+**Findings:**
+
+| Aspect | Status | Detail |
+|--------|--------|--------|
+| Budget initialization | ✅ GOOD | `IterationBudget` is recreated fresh at the start of each turn (`agent.iteration_budget = IterationBudget(agent.max_iterations)`) — subagent iterations from prior turns do not bleed into the next turn. |
+| Thread-safe consume | ✅ GOOD | `IterationBudget` uses `threading.Lock` around all `_used` accesses; `consume()` returns bool and is idempotent under contention. |
+| Grace call mechanism | ✅ GOOD | `_budget_grace_call` allows one additional iteration after budget exhaustion. The flag is cleared when consumed so the loop exits after that iteration regardless of outcome. |
+| Refund mechanism | ✅ GOOD | `execute_code` iterations call `iteration_budget.refund()` so programmatic calls don't eat the budget. Refund is also called on Ollama context errors (line 948). |
+| Iteration vs api_call_count | ✅ GOOD | `api_call_count` and `iteration_budget` are synchronized — on Ollama context errors both are decremented together. |
+| max_iterations default | ✅ GOOD | Default is 90 per the AIAgent signature; subagents default to 50 via `delegation.max_iterations`. |
+
+**Potential Issue:** `IterationBudget.remaining` computes `max(0, max_total - _used)` but the outer loop condition checks `agent.iteration_budget.remaining > 0`. This is correct, but note that `remaining` is a property that recomputes on every call (not cached), so the lock is taken on every loop iteration. This is correct behavior, not a performance issue.
+
+**Verdict:** Iteration limit enforcement is well-implemented, thread-safe, and correctly reset per turn.
+
+---
+
+### 96-2 | State Machine Correctness
+
+**Components:** `agent/conversation_loop.py` (main loop), `agent/think_scrubber.py` (state machine), `gateway/run.py` (gateway session state)
+
+**Findings:**
+
+| Aspect | Status | Detail |
+|--------|--------|--------|
+| Main loop state | ✅ GOOD | The `while` loop at line 644 is the sole orchestrator: `(api_call_count < max_iterations and iteration_budget.remaining > 0) or _budget_grace_call`. Exit reasons tracked via `_turn_exit_reason`. |
+| Interrupt state | ✅ GOOD | `_interrupt_requested` is checked at the top of every loop iteration (line 649). Thread affinity is set via `_execution_thread_id = threading.current_thread().ident` before the interrupt check, ensuring signal scoping is precise. |
+| State reset per turn | ✅ GOOD | Lines 319–338 reset all retry counters, scrubbers, tool guardrails, and vision flag at the start of each `run_conversation()` call. Streams from prior interrupted calls cannot taint subsequent turns. |
+| Thinking scrubber state machine | ✅ GOOD | `agent/think_scrubber.py` implements a delta-level state machine across stream chunks to handle unterminated `<think>` tags at chunk boundaries. Resets on each new turn. |
+| Stream context scrubber | ✅ GOOD | `_stream_context_scrubber` and `_stream_think_scrubber` are reset at turn start (lines 417–424) to prevent hung spans from prior interrupted streams. |
+| Gateway session state persistence | ✅ GOOD | Gateway `session_store` entries are preserved across restarts. Stuck sessions are auto-suspended (see 96-3 below). |
+| No invalid state transitions | ✅ GOOD | No state machine definition found in the codebase that could have invalid transitions — the "state" is distributed across many booleans/counters that are individually well-behaved. |
+
+**Crash persistence:** `gateway/run.py` persists session state to SQLite. The `_increment_restart_failure_counts` mechanism tracks sessions active at shutdown and suspends those that hit the stuck loop threshold (3 restarts). This is a form of crash-persistent state detection.
+
+**Verdict:** State machine correctness is solid. Reset patterns are consistent and thread-safe.
+
+---
+
+### 96-3 | Tool Call Loops: Detection Mechanism
+
+**Components:** `gateway/run.py` (stuck loop detection), `tests/gateway/test_stuck_loop.py`
+
+**Findings:**
+
+| Aspect | Status | Detail |
+|--------|--------|--------|
+| Restart-failure tracking | ✅ GOOD | `_STUCK_LOOP_THRESHOLD = 3` — sessions active across 3+ consecutive gateway restarts are auto-suspended. Counters persisted to `~/.hermes/.restart_failure_counts` (JSON). |
+| Active session set tracking | ✅ GOOD | `_increment_restart_failure_counts(active_session_keys: set)` — only sessions in the active set are incremented; inactive sessions are pruned from the file on restart. |
+| Suspend mechanism | ✅ GOOD | `_suspend_stuck_loop_sessions()` suspends sessions that hit the threshold, logs a warning, and clears the counter file after suspension. |
+| Clear on success | ✅ GOOD | `_clear_restart_failure_count(session_key)` called after successful agent turns to reset counters when the loop is broken. |
+| No-op when no file | ✅ GOOD | Both suspend and clear operations are safe when the file doesn't exist. |
+| Test coverage | ✅ GOOD | `tests/gateway/test_stuck_loop.py` covers: file creation, accumulation, inactive session pruning, threshold suspension, below-threshold no-op, clear on success, file cleanup, and no-crash on missing file. |
+
+**Bypass potential:** The detection is based on **gateway restarts**, not per-turn tool call counts. Within a single long-running gateway, there is no in-loop tool call repetition detection. A session that gets stuck without causing a gateway restart (agent hangs but gateway stays alive) would not be auto-suspended by this mechanism.
+
+**Verdict:** Stuck loop detection is robust for crash-restart cycles, but relies on the restart signal as the trigger. No in-loop tool call repetition counter exists within a single session.
+
+---
+
+### 96-4 | Error Propagation
+
+**Components:** `agent/conversation_loop.py` (main error handling), `agent/error_classifier.py`
+
+**Findings:**
+
+| Aspect | Status | Detail |
+|--------|--------|--------|
+| API error classification | ✅ GOOD | `classify_api_error()` from `agent/error_classifier.py` routes errors to `FailoverReason` enum (rate_limit, context_too_large, auth_error, etc.) which drives retry/fallback decisions. |
+| Nous rate limit guard | ✅ GOOD | `nous_rate_guard.py` prevents API calls when Nous Portal is rate-limited. Failures in the guard are caught with `except Exception: pass` at line 1048 — a deliberate "never let rate guard break the agent loop" policy. |
+| Plugin hooks | ⚠️ MIXED | `pre_llm_call`, `pre_api_request`, `post_llm_call`, `transform_llm_output` all wrapped in `try/except Exception` with `logger.warning(...)` on failure. Errors are logged but do not halt the agent. This is broadly correct — plugin failures should not break the agent — but means a broken plugin silently degrades. |
+| Session DB writes | ✅ GOOD | `update_system_prompt`, `_session_db.update_*` calls wrapped in `try/except Exception` at WARNING level — persistent failures surface in logs without breaking the turn. |
+| Tool result sanitization | ✅ GOOD | `except Exception: pass` at line 351 (cleanup dead connections), 1091 (pre_api_request hook), 1046–1049 (Nous rate guard). All are defensive; errors logged at debug level. |
+| Error context preservation | ✅ GOOD | `_turn_exit_reason` string set on every exit path. Error details stored in result dict keys: `error`, `failed`, `partial`. Turn-level error context is not lost — it's surfaced in the result dict and log messages. |
+|thinking exhaustion error | ✅ GOOD | `thinking_exhausted` detection (lines 1440–1498) produces a user-friendly message and returns with clear `error` field instead of silently continuing. |
+| Ollama context error | ✅ GOOD | Returns with `failed=True` and clear message; iteration budget refunded. |
+
+**Silent swallowing concern:** The pattern `except Exception: pass` (bare) appears in several places. In most cases this is intentional (defensive cleanup, plugin hooks). However, the Nous rate guard `except Exception: pass` at line 1048 is particularly noteworthy — it means if the rate guard itself throws (e.g., disk full writing its state file), the agent proceeds as if no rate limit exists, potentially worsening a rate limit situation. This is documented as intentional ("never let rate guard break the agent loop") but worth noting.
+
+**Verdict:** Error propagation is generally good. Errors are classified, surfaced in results, and logged. Plugin/tool errors are non-fatal by design. The main risk is the intentional silent bypass in the Nous rate guard.
+
+---
+
+### 96-5 | Context Window Management
+
+**Components:** `agent/conversation_compression.py`, `agent/conversation_loop.py` (preflight compression)
+
+**Findings:**
+
+| Aspect | Status | Detail |
+|--------|--------|--------|
+| Preflight compression | ✅ GOOD | Before entering the main loop, if `compression_enabled` and messages exceed threshold, preflight compression runs with up to 3 passes. Retry counters are reset after compression so the model gets a fresh budget on compressed context (lines 516–524). |
+| ContextCompressor threshold | ✅ GOOD | Threshold is `int(context_length * threshold_percent)` — dynamically computed from model context window, not a fixed number. |
+| Compression model feasibility check | ✅ GOOD | `check_compression_model_feasibility()` validates the auxiliary compression model's context window at startup. Auto-lowers threshold if aux is smaller than main model. Hard-rejects auxes below 64K. |
+| Ephemeral max_tokens override | ✅ GOOD | `_ephemeral_max_output_tokens` is a one-shot override for output-cap errors (line 279 of `test_ctx_halving_fix.py`). This separates `max_tokens` (output cap) from `context_length` (total window), fixing a prior bug where output-cap errors incorrectly halved context_length. |
+| Prompt cache prefix preservation | ✅ GOOD | Plugin context injected at API-call time only (into the user message, not system prompt), preserving the Anthropic cache prefix. `_cached_system_prompt` is reused verbatim across turns. |
+| Context overflow handling | ✅ GOOD | If preflight compression can't reduce tokens below threshold after 3 passes, the loop still proceeds — compression failures are logged but don't hard-fail the request. The model receives whatever context fits. |
+| Critical info preservation | ✅ GOOD | `protect_first_n` and `protect_last_n` parameters in `ContextCompressor` ensure the first N messages (system prompt, instructions) and last N messages (recent context) are never compressed — critical info is preserved. |
+
+**Context overflow scenario:** In very long sessions with small context windows, preflight compression may not be able to reduce content below the threshold in 3 passes. The code currently allows the turn to proceed with whatever fits, rather than failing hard. This is a graceful degradation approach.
+
+**Compression during retry:** Lines 502–533 show that after each compression pass, `_preflight_tokens` is re-estimated and the loop breaks early if under threshold. This prevents unnecessary extra passes.
+
+**Verdict:** Context window management is sophisticated and well-tested. Compression is dynamic, preflight is proactive, and critical information preservation is built in. The `parse_available_output_tokens_from_error` mechanism properly separates output-cap errors from context-overflow errors.
+
+---
+
+### Summary Table
+
+| # | Area | Verdict | Notes |
+|---|------|---------|-------|
+| P96-1 | Iteration limits (max_iterations enforcement, infinite loops, thread safety) | ✅ GOOD | Thread-safe `IterationBudget`, per-turn reset, grace call mechanism. No infinite loop risk. |
+| P96-2 | State machine correctness (invalid transitions, dead states, crash persistence) | ✅ GOOD | Per-turn state reset, interrupt signal threading, scrubber state machines, crash-persistent session suspension. |
+| P96-3 | Tool call loops (detection mechanism, repetitive calls, bypass) | ✅ GOOD (with gap) | Restart-failure tracking works well. No in-loop repetition counter for long-running sessions. |
+| P96-4 | Error propagation (tool errors, silent swallowing, context preservation) | ⚠️ MOSTLY GOOD | Errors classify and propagate correctly. Intentional silent swallow in Nous rate guard; plugin errors non-fatal by design. |
+| P96-5 | Context window management (compression, critical info preservation, overflow) | ✅ GOOD | Preflight compression, dynamic thresholds, ephemeral max_tokens fix, critical info preservation via protect_first_n/protect_last_n. |
+
+---
+
+*Pass #96 complete — 2026-05-26T14:05:00Z*
+*Commit at scan: 5a51a1f65*
