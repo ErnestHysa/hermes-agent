@@ -11304,3 +11304,152 @@ If any match: **mutation refused**, returns error.
 
 *Pass #81 complete — 2026-05-25T02:30:00Z*
 *Commit at scan: 5a51a1f65*
+
+## Pass #83 – Kubernetes, Container & Sandbox Environment Deep Dive – 2026-05-25T12:00:00Z
+
+---
+
+### 83.1 Container Security Context
+
+**Files examined:** `tools/environments/docker.py`, `Dockerfile`, `docker-compose.yml`, `docker/entrypoint.sh`
+
+**Privileged containers:** None found. The project explicitly avoids privileged containers.
+
+**Capability drops (docker.py lines 159-169):**
+```
+_BASE_SECURITY_ARGS = [
+    "--cap-drop", "ALL",
+    "--cap-add", "DAC_OVERRIDE",
+    "--cap-add", "CHOWN",
+    "--cap-add", "FOWNER",
+    "--security-opt", "no-new-privileges",
+    "--pids-limit", "256",
+    "--tmpfs", "/tmp:rw,nosuid,size=512m",
+    "--tmpfs", "/var/tmp:rw,noexec,nosuid,size=256m",
+    "--tmpfs", "/run:rw,noexec,nosuid,size=64m",
+]
+```
+When the container starts as root and needs to drop to the `hermes` user via gosu, SETUID and SETGID are added (lines 174-177). When `--user` is passed, gosu caps are skipped since the container starts unprivileged.
+
+**Filesystem:** Containers run with a **writable filesystem** (no `readOnlyRootFilesystem`). The project intentionally allows agents to install packages (pip, npm, apt) inside containers. tmpfs is used for /tmp, /var/tmp, /run with size limits as a hardened scratch alternative.
+
+**User:** Dockerfile creates a non-root `hermes` user (UID 10000). docker-compose.yml supports remapping via `HERMES_UID`/`HERMES_GID` environment variables. Entrypoint uses `gosu` to drop root to hermes before running the agent.
+
+---
+
+### 83.2 Kubernetes Network Policies
+
+**Finding:** The project does **not** ship native Kubernetes manifests, deployment yamls, or helm charts. There is no `kubeconfig` in the repository and no Kubernetes operator pattern.
+
+The only NetworkPolicy reference found is in `optional-skills/mlops/tensorrt-llm/references/serving.md` (line 405), a documentation reference in a serving skill — not a deployed policy.
+
+**docker-compose.yml networking:**
+- Both `gateway` and `dashboard` services use `network_mode: host`
+- This intentionally bypasses Docker's virtual networking, placing services directly on the host network
+- This is documented in the compose file security notes
+- No iptables/Docker network isolation between the two services
+
+**Network isolation options in DockerEnvironment:**
+- The `network: bool` parameter (default `True`) maps to `--network=none` when `False` (docker.py line 337)
+- This provides network isolation for containers that need it
+
+---
+
+### 83.3 Secrets in Kubernetes / Container Environments
+
+**No Kubernetes secrets found.** The project does not target k8s deployments natively.
+
+**Secrets storage:**
+- API keys and secrets stored in `~/.hermes/.env` (dotenv file)
+- `CONTRIBUTING.md` explicitly names `~/.hermes/.env` as containing API keys and secrets
+- `gateway/config.py` loads secrets from environment variables (e.g., `DINGTALK_CLIENT_SECRET`, `WECOM_SECRET`, `FEISHU_APP_SECRET`, etc.)
+
+**Container credential mounts (docker.py lines 403-449):**
+- `get_credential_file_mounts()` — OAuth tokens and declared credential files mounted **read-only** (`:ro`) into containers
+- `get_skills_directory_mount()` — skill directories mounted read-only
+- `get_cache_directory_mounts()` — cache directories (documents, images, audio, screenshots) mounted read-only
+- This means containers can authenticate against external services but cannot modify host credentials
+
+**Secrets scrubbing:**
+- `tools/code_execution_tool.py` line 118 defines `_scrub_child_env()` which strips API keys from the environment before passing to the execute_code child subprocess
+- `CONTRIBUTING.md` line 790: "Code execution sandbox runs with API keys stripped from environment"
+- `_HERMES_PROVIDER_ENV_BLOCKLIST` filters provider env vars from Docker container init env (docker.py line 552)
+- `SECURITY.md` section 2.3 acknowledges that credential filtering "reduces casual exfiltration" but "is not containment"
+
+**Encryption at rest:** No secrets encryption at rest mechanism found in the codebase. The dotenv file itself is not encrypted on disk.
+
+---
+
+### 83.4 Container Escape Vectors
+
+**Host filesystem mounts:**
+- `docker_mount_cwd_to_workspace` defaults to `False` (cli.py line 379)
+- Host cwd mount is **explicit opt-in only**, not automatic
+- `network_mode: host` in docker-compose places services on host network directly
+- No Docker socket volume mount in docker-compose.yml (docker socket NOT exposed by default)
+- Credential files and skills are mounted read-only (`:ro`) preventing container modification
+
+**Namespace sharing:** No shared namespace configuration found. The NixOS module (`nix/nixosModules.nix` line 903) sets `ProtectSystem = "strict"` which provides systemd-style mount namespacing as a layer outside containers.
+
+**Privileged operations:** The project avoids privileged containers. All Linux capabilities are dropped (`--cap-drop ALL`) and only the minimum needed are added back. gosu privilege drop is protected by `no-new-privileges` — after dropping to hermes user, the process cannot escalate back to root.
+
+**Known gap — execute_code sandbox:** Prior Pass #39 (findings.md line 1969) identified that the execute_code sandbox does not use seccomp, namespaces, or cgroups — the child process runs with the same syscall interface as the parent. This is a known attack vector if a malicious or compromised LLM generates code that makes syscalls like `ptrace` or `socket` for data exfiltration.
+
+**Known gap — plugin isolation:** Prior Pass #44 (findings.md line 2910) identified that plugins execute in the same Python process as the agent with no seccomp, namespace isolation, resource limits, or restricted filesystem view.
+
+---
+
+### 83.5 Sandbox Environment Isolation
+
+**Docker container as primary sandbox unit:**
+- Each DockerEnvironment creates a **separate container** per session/task (docker.py line 505 — UUID-based container naming)
+- Containers are isolated from each other by Docker's network and filesystem layers
+- Persistent filesystem mode uses bind mounts from `~/.hermes/sandboxes/docker/<task_id>/` — unique per task
+- Non-persistent mode uses tmpfs for /workspace, /root, /home — ephemeral, cleaned on container stop
+
+**Credential file mounts:** Read-only, preventing cross-sandbox credential tampering. Mount paths include:
+- OAuth tokens via `get_credential_file_mounts()`
+- Skills directories (local + external) via `get_skills_directory_mount()`
+- Cache directories (documents, images, audio) via `get_cache_directory_mounts()`
+
+**Resource limits:**
+- CPU limit via `--cpus`
+- Memory limit via `--memory`
+- Disk quota via `--storage-opt size=<N>m` (when platform supports it)
+- PID limit of 256 via `--pids-limit`
+- tmpfs scratch spaces with size limits (512m /tmp, 256m /var/tmp, 64m /run)
+
+**Network isolation:**
+- `--network=none` available and documented for fully isolated containers
+- `network: bool` parameter in DockerEnvironment controls this
+
+**No cross-sandbox data leakage controls found:** There is no mechanism that prevents two concurrent DockerEnvironment containers from communicating with each other if they both have network access. The isolation is implicit in Docker's container networking, not explicitly enforced with firewall rules or policies.
+
+**Known gap — process-level isolation only:** Prior Pass #71 (findings.md line 8575) noted process-level isolation without seccomp/AppArmor. A determined adversarial process could make arbitrary syscalls. The NixOS systemd service sets `NoNewPrivileges` and `ProtectSystem=strict` as additional layers.
+
+---
+
+### 83.6 Summary Table
+
+| Area | Finding | Severity |
+|------|---------|----------|
+| Container capabilities | `--cap-drop ALL` + minimal add-back (DAC_OVERRIDE, CHOWN, FOWNER, optional SETUID/SETGID) | GOOD |
+| Container privilege | No privileged containers; `no-new-privileges` set | GOOD |
+| Container filesystem | Writable but with size-limited tmpfs for scratch | ACCEPTABLE |
+| Kubernetes | No k8s manifests or deployments | N/A (not targeted) |
+| Docker networking | `network_mode: host` bypasses container networking; `--network=none` available for isolation | ACCEPTABLE |
+| Secrets on disk | Unencrypted dotenv at `~/.hermes/.env` | ACCEPTABLE |
+| Credential mounts | Read-only mount of credential files into containers | GOOD |
+| Secrets scrubbing in execute_code | `_scrub_child_env()` strips API keys from child process env | GOOD |
+| Host mounts | Explicit opt-in only; default off | GOOD |
+| Container escape mitigations | No host mounts by default; read-only credential mounts; gosu + no-new-privileges | GOOD |
+| execute_code sandbox | No seccomp/namespace/cgroup isolation (known gap, prior P39) | MEDIUM |
+| Plugin isolation | No seccomp/namespace isolation (known gap, prior P44) | MEDIUM |
+| Cross-sandbox isolation | Implicit via Docker, not explicitly enforced with policies | INFO |
+| Process-level isolation | No seccomp/AppArmor at syscall level (known gap, prior S71) | LOW |
+
+---
+
+*Pass #83 complete — 2026-05-25T12:00:00Z*
+*Commit at scan: 5a51a1f65*
+*Next: Pass #84*
