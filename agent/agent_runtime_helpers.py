@@ -913,6 +913,34 @@ def restore_primary_runtime(agent) -> bool:
             api_mode=rt.get("compressor_api_mode", ""),
         )
 
+        # P30-8 FIX: Re-resolve memory provider tool schemas for the restored primary
+        # provider.  Without this, schemas loaded at init-time (for the primary)
+        # are stale after a fallback session — the fallback may have used a
+        # different tool format (e.g. chat_completions vs. anthropic_messages).
+        # Re-add schemas from memory providers so subsequent turns use correct
+        # provider-specific schemas.
+        if hasattr(agent, "_memory_manager") and agent._memory_manager is not None:
+            # Identify memory-tool names so we can replace only those entries
+            mem_tool_names = set()
+            mem_schemas = []
+            for _schema in agent._memory_manager.get_all_tool_schemas():
+                _tname = _schema.get("name", "")
+                if _tname:
+                    mem_tool_names.add(_tname)
+                mem_schemas.append(_schema)
+            # Remove old memory-tool entries
+            if mem_tool_names and hasattr(agent, "tools") and agent.tools:
+                agent.tools = [
+                    t for t in agent.tools
+                    if t.get("function", {}).get("name") not in mem_tool_names
+                ]
+            # Re-add schemas for primary provider's memory tools
+            for _schema in mem_schemas:
+                _wrapped = {"type": "function", "function": _schema}
+                agent.tools.append(_wrapped)
+            if mem_tool_names and hasattr(agent, "valid_tool_names"):
+                agent.valid_tool_names |= mem_tool_names
+
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
         agent._fallback_index = 0
