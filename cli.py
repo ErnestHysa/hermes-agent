@@ -3200,8 +3200,13 @@ class HermesCLI:
         # These must exist before any direct chat() call because single-query
         # mode does not go through run().
         self._agent_running = False
-        self._pending_input = queue.Queue()
-        self._interrupt_queue = queue.Queue()
+        # Bounded to prevent unbounded memory growth if the agent stalls
+        # (e.g. a long-running tool that never returns).  A full queue acts
+        # as backpressure — producers block briefly until the consumer drains
+        # space.  1000-item limit ≈ 100 seconds of buffering at the consumer
+        # rate of 10 msg/s, far exceeding any legitimate message volume.
+        self._pending_input = queue.Queue(maxsize=1000)
+        self._interrupt_queue = queue.Queue(maxsize=100)
         # Tracks whether the turn that just finished was interrupted via
         # Ctrl+C. Consumed by _maybe_continue_goal_after_turn so /goal loops
         # don't auto-queue another continuation on top of a user-cancelled
