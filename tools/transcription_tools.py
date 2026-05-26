@@ -1163,8 +1163,11 @@ def _prepare_local_audio(file_path: str, work_dir: str) -> tuple[Optional[str], 
     command = [ffmpeg, "-y", "-i", file_path, converted_path]
 
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
+        subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
         return converted_path, None
+    except subprocess.TimeoutExpired:
+        logger.error("ffmpeg conversion timed out for %s (>60s)", file_path)
+        return None, "Audio conversion timed out (60s limit) — file may be corrupt or too large"
     except subprocess.CalledProcessError as e:
         details = e.stderr.strip() or e.stdout.strip() or str(e)
         logger.error("ffmpeg conversion failed for %s: %s", file_path, details)
