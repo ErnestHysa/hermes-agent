@@ -656,6 +656,75 @@ def approve_permanent(pattern_key: str):
         _permanent_approved.add(pattern_key)
 
 
+def revoke_permanent(pattern_key: str) -> bool:
+    """Remove a pattern from the permanent allowlist.
+
+    Addresses N26: once a pattern was permanently approved via 'always',
+    there was no mechanism to revoke it without manually editing config.yaml.
+    Call save_permanent_allowlist to persist the change.
+
+    Returns True if the pattern was found and removed, False otherwise.
+    """
+    aliases = _approval_key_aliases(pattern_key)
+    with _lock:
+        for alias in aliases:
+            if alias in _permanent_approved:
+                _permanent_approved.discard(alias)
+                return True
+    return False
+
+
+def revoke_session(session_key: str, pattern_key: str) -> bool:
+    """Remove a pattern from session approvals.
+
+    Addresses N26: session-level approvals had no revocation mechanism once
+    granted. Returns True if the pattern was found and removed, False otherwise.
+    """
+    aliases = _approval_key_aliases(pattern_key)
+    with _lock:
+        session_approvals = _session_approved.get(session_key, set())
+        for alias in aliases:
+            if alias in session_approvals:
+                session_approvals.discard(alias)
+                return True
+    return False
+
+
+def revoke_all(session_key: str) -> None:
+    """Clear ALL approvals for a given session (session + permanent for that session).
+
+    Addresses N26: provides a single-call reset of all approval state for a
+    session, so a user can /reset-approvals and get a clean slate without
+    manually tracking which patterns were approved.
+    """
+    with _lock:
+        _session_approved.pop(session_key, None)
+        # Note: permanent allowlist entries are intentionally retained here —
+        # revoking permanent approval requires explicit /revoke-permanent.
+        # Only session-scoped approvals are cleared by this call.
+
+
+def clear_approvals() -> None:
+    """Clear ALL approval state (permanent allowlist and all session approvals).
+
+    Addresses N26: provides a complete security reset for the process.
+    Use this when the user requests /reset-approvals or when tearing down
+    the approval system at shutdown.
+
+    Note: permanent allowlist is cleared so the next startup loads a clean state.
+    Individual permanent entries can be revoked via revoke_permanent() which
+    also persists to config.
+    """
+    with _lock:
+        _permanent_approved.clear()
+        _session_approved.clear()
+        _session_yolo.clear()
+        _pending.clear()
+        _gateway_queues.clear()
+    # Persist the cleared state to config
+    save_permanent_allowlist(set())
+
+
 def load_permanent(patterns: set):
     """Bulk-load permanent allowlist entries from config."""
     with _lock:

@@ -143,7 +143,7 @@ def _get_backend() -> ComputerUseBackend:
 
 
 def reset_backend_for_tests() -> None:  # pragma: no cover
-    """Test helper — tear down the cached backend."""
+    """Test helper — tear down the cached backend and approval state."""
     global _backend, _session_auto_approve, _always_allow
     with _backend_lock:
         if _backend is not None:
@@ -153,7 +153,7 @@ def reset_backend_for_tests() -> None:  # pragma: no cover
                 pass
         _backend = None
     _session_auto_approve = False
-    _always_allow = set()
+    _always_allow.clear()
 
 
 class _NoopBackend(ComputerUseBackend):  # pragma: no cover
@@ -264,6 +264,15 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
 def _request_approval(action: str, args: Dict[str, Any]) -> Optional[str]:
     """Return None if approved, or a JSON error string if denied."""
     global _session_auto_approve, _always_allow
+
+    # YOLO mode: bypass all approval checks (frozen at module load to prevent
+    # prompt-injection escalation). Mirrors the _YOLO_MODE_FROZEN check in
+    # approval.check_dangerous_command so computer_use actions are properly
+    # covered by the same yolo umbrella as terminal commands.
+    from tools.approval import _YOLO_MODE_FROZEN
+    if _YOLO_MODE_FROZEN:
+        return None
+
     if _session_auto_approve:
         return None
     if action in _always_allow:
@@ -287,6 +296,22 @@ def _request_approval(action: str, args: Dict[str, Any]) -> Optional[str]:
             _session_auto_approve = True
         return None
     return json.dumps({"error": "denied by user", "action": action})
+
+
+def reset_approvals() -> None:
+    """Clear all computer_use approval state.
+
+    Revokes both the session-level always-approve flag and the per-action
+    allowlist set. Call this when the user requests a security reset (e.g.
+    /reset-approvals command) or when the session terminates so that a new
+    session does not inherit approvals from the previous one.
+
+    Addresses N26: always_approve had no revocation mechanism — the only way
+    to clear _always_allow was to restart the process.
+    """
+    global _session_auto_approve, _always_allow
+    _session_auto_approve = False
+    _always_allow.clear()
 
 
 def _summarize_action(action: str, args: Dict[str, Any]) -> str:
