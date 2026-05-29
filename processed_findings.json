@@ -352,5 +352,11 @@
     "pr_url": "https://github.com/NousResearch/hermes-agent/pull/34927",
     "pr_number": 34927,
     "run_id": "20260529_222349"
+  },
+  "SSRF-discord_tool.py-87": {
+    "status": "filed",
+    "pr_url": "https://github.com/NousResearch/hermes-agent/pull/34928",
+    "pr_number": 34928,
+    "run_id": "20260529_222349"
   }
 }

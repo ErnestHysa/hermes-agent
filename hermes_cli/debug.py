@@ -307,7 +307,7 @@ def _upload_dpaste_com(content: str, expiry_days: int = 7) -> str:
             "User-Agent": "hermes-agent/debug-share",
         },
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:  # SSRF: add IP block check
         url = resp.read().decode("utf-8").strip()
     if not url.startswith("http"):
         raise ValueError(f"Unexpected response from dpaste.com: {url[:200]}")
