@@ -496,6 +496,7 @@ class CDPSupervisor:
         if not session_id:
             return {"ok": False, "error": "supervisor has no attached page session"}
 
+import shlex
         async def _do_eval() -> Dict[str, Any]:
             return await self._cdp(
                 "Runtime.evaluate",
