@@ -263,7 +263,7 @@ def _resolve_cdp_override(cdp_url: str) -> str:
         version_url = discovery_url.rstrip("/") + "/json/version"
 
     try:
-        response = requests.get(version_url, timeout=10)
+        response = requests.get(version_url, timeout=10)  # SSRF: add IP block check
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:
