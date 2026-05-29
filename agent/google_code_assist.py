@@ -153,7 +153,7 @@ def _post_json(
         headers=_build_headers(access_token, user_agent_model=user_agent_model),
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # SSRF: add IP block check
             raw = response.read().decode("utf-8", errors="replace")
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as exc:
