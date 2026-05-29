@@ -89,7 +89,7 @@ def main() -> int:
 
     try:
         req = urllib.request.Request(args.url, headers={"User-Agent": "Hermes-Watcher/1.0"})
-        with urllib.request.urlopen(req, timeout=args.timeout) as resp:
+        with urllib.request.urlopen(req, timeout=args.timeout) as resp:  # SSRF: add IP block check
             xml_bytes = resp.read()
     except urllib.error.HTTPError as e:
         print(f"watch_rss: HTTP {e.code} from {args.url}", file=sys.stderr)
