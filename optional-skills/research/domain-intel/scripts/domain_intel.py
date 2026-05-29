@@ -33,7 +33,7 @@ def subdomains(domain, include_expired=False, limit=200):
     req = urllib.request.Request(url, headers={
         "User-Agent": "domain-intel-skill/1.0", "Accept": "application/json",
     })
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with urllib.request.urlopen(req, timeout=15) as r:  # SSRF: add IP block check
         entries = json.loads(r.read().decode())
 
     seen, results = set(), []
