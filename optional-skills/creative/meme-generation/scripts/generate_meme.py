@@ -43,7 +43,7 @@ def _fetch_url(url: str, timeout: int = 15) -> bytes:
         resp.raise_for_status()
         return resp.content
     import urllib.request
-    return urllib.request.urlopen(url, timeout=timeout).read()
+    return urllib.request.urlopen(url, timeout=timeout).read()  # SSRF: add IP block check
 
 
 def load_curated_templates() -> dict:
