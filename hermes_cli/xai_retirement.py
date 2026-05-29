@@ -201,7 +201,7 @@ def apply_migration(
             config_changed=False,
         )
 
-    yaml = YAML(typ="rt")
+    yaml = YAML(typ="safe")
     yaml.preserve_quotes = True
     with config_path.open("r", encoding="utf-8") as fh:
         doc = yaml.load(fh)
