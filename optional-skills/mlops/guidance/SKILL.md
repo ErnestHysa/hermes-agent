@@ -380,12 +380,13 @@ print(lm["answer"])
 
 ```python
 from guidance import models, gen, select, guidance
+import ast
 
 @guidance(stateless=False)
 def react_agent(lm, question):
     """ReAct agent with tool use."""
     tools = {
-        "calculator": lambda expr: eval(expr),
+        "calculator": lambda expr: ast.literal_eval(expr),
         "search": lambda query: f"Search results for: {query}",
     }
 
