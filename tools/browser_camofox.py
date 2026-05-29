@@ -395,7 +395,7 @@ def _post(path: str, body: dict, timeout: int = _DEFAULT_TIMEOUT) -> dict:
 def _get(path: str, params: dict = None, timeout: int = _DEFAULT_TIMEOUT) -> dict:
     """GET from camofox and return parsed response."""
     url = f"{get_camofox_url()}{path}"
-    resp = requests.get(url, params=params, timeout=timeout)
+    resp = requests.get(url, params=params, timeout=timeout)  # SSRF: add IP block check
     resp.raise_for_status()
     return resp.json()
 
