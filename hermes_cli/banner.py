@@ -181,7 +181,7 @@ def _fetch_pypi_latest(package: str = "hermes-agent") -> Optional[str]:
         import urllib.request
         url = f"https://pypi.org/pypi/{package}/json"
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=5) as resp:  # SSRF: add IP block check
             data = json.loads(resp.read())
             return data.get("info", {}).get("version")
     except Exception:
