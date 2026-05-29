@@ -4835,7 +4835,7 @@ def _post_registration(base_url: str, body: Dict[str, str]) -> dict:
     data = urlencode(body).encode("utf-8")
     req = Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
     try:
-        with urlopen(req, timeout=_ONBOARD_REQUEST_TIMEOUT_S) as resp:
+        with urlopen(req, timeout=_ONBOARD_REQUEST_TIMEOUT_S) as resp:  # SSRF: add IP block check
             return json.loads(resp.read().decode("utf-8"))
     except HTTPError as exc:
         body_bytes = exc.read()
