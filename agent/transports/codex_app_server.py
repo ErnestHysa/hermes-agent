@@ -256,7 +256,7 @@ class CodexAppServerClient:
         try:
             if timeout <= 0:
                 return self._server_requests.get_nowait()
-            return self._server_requests.get(timeout=timeout)
+            return self._server_requests.get(timeout=timeout)  # SSRF: add IP block check
         except queue.Empty:
             return None
 
