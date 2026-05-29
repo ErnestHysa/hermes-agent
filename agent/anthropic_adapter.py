@@ -950,7 +950,7 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:  # SSRF: add IP block check
                 result = json.loads(resp.read().decode())
         except Exception as exc:
             last_error = exc
