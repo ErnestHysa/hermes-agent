@@ -360,7 +360,7 @@ def _http_get(url: str, retries: int = 5, timeout: int = 20) -> Any:
     last_err: Exception = RuntimeError("No attempts made")
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # SSRF: add IP block check
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
             if e.code == 429:
