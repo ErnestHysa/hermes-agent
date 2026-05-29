@@ -46,7 +46,7 @@ def get(
     for attempt in range(max_retries + 1):
         req = urllib.request.Request(url, headers=h)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # SSRF: add IP block check
                 return resp.read()
         except urllib.error.HTTPError as e:
             if e.code == 429:
