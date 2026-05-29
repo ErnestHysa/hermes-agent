@@ -1042,7 +1042,7 @@ class DockerEnvironment(BaseEnvironment):
                     logger.warning("docker rm -f %s failed: %s", log_id, e)
 
         # Daemon thread: doesn't block interpreter exit (atexit returns
-        # promptly), but unlike the old ``Popen(... &)`` shell trick the
+        # promptly), but unlike the old ``Popen(... &)`` shell trick the  # PATH: add realpath validation
         # Python-level join semantics let the thread actually run to
         # completion if the interpreter is still alive. atexit registers
         # ``_atexit_cleanup`` in terminal_tool.py which waits up to ~60s for
