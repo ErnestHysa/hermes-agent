@@ -16,5 +16,11 @@
     "pr_url": "https://github.com/NousResearch/hermes-agent/pull/34998",
     "pr_number": 34998,
     "run_id": "20260529_233517"
+  },
+  "SSRF-webhook.py-293": {
+    "status": "filed",
+    "pr_url": "https://github.com/NousResearch/hermes-agent/pull/34999",
+    "pr_number": 34999,
+    "run_id": "20260529_233517"
   }
 }
