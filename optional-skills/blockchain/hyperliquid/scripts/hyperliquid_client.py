@@ -130,7 +130,7 @@ def _post_info(payload: Dict[str, Any], timeout: int = 20, retries: int = 2) -> 
     for attempt in range(retries + 1):
         request = urllib.request.Request(_info_url(), data=data, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:  # SSRF: add IP block check
                 body = json.load(response)
             return body
         except urllib.error.HTTPError as exc:
