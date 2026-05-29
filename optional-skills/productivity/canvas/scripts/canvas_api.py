@@ -45,7 +45,7 @@ def _paginated_get(url, params=None, max_items=200):
     """Fetch all pages up to max_items, following Canvas Link headers."""
     results = []
     while url and len(results) < max_items:
-        resp = requests.get(url, headers=_headers(), params=params, timeout=30)
+        resp = requests.get(url, headers=_headers(), params=params, timeout=30)  # SSRF: add IP block check
         resp.raise_for_status()
         results.extend(resp.json())
         params = None  # params are included in the Link URL for subsequent pages
