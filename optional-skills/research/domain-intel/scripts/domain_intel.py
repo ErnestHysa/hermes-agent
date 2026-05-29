@@ -233,7 +233,7 @@ def dns_records(domain, types=None):
             url = f"https://dns.google/resolve?name={urllib.parse.quote(domain)}&type={qtype}"
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "domain-intel-skill/1.0"})
-                with urllib.request.urlopen(req, timeout=10) as r:
+                with urllib.request.urlopen(req, timeout=10) as r:  # SSRF: add IP block check
                     data = json.loads(r.read())
                 records[qtype] = [
                     a.get("data", "").strip().rstrip(".")
